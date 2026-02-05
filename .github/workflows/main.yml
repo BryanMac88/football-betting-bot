@@ -10,42 +10,18 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+      FOOTBALL_DATA_TOKEN: ${{ secrets.FOOTBALL_DATA_TOKEN }}
       SHEET_ID: ${{ secrets.SHEET_ID }}
       GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
 
-      REGION: uk
       BANKROLL: "100"
       KELLY_FRACTION: "0.25"
-      MIN_EDGE: "0.03"
 
       PYTHONUNBUFFERED: "1"
-      LOG_LEVEL: "DEBUG"
 
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
-
-      - name: Show repo structure
-        shell: bash
-        run: |
-          set -e
-          echo "Top level:"
-          ls -la
-          echo ""
-          echo "src:"
-          ls -la src || true
-          echo ""
-          echo "Python files under src (max depth 3):"
-          find src -maxdepth 3 -type f -name "*.py" -print || true
-          echo ""
-          echo "Preview src/main.py (first 200 lines):"
-          if [ -f src/main.py ]; then
-            nl -ba src/main.py | sed -n '1,200p'
-          else
-            echo "❌ src/main.py not found"
-            exit 1
-          fi
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -56,60 +32,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          python -V
 
-      - name: Validate secrets (won't print secrets)
+      - name: Run bot
         run: |
-          python - << 'PY'
-          import os, json, sys
-          required = ["ODDS_API_KEY", "SHEET_ID", "GOOGLE_SERVICE_ACCOUNT_JSON"]
-          missing = [k for k in required if not os.getenv(k)]
-          if missing:
-              print("❌ Missing required GitHub secrets:", missing)
-              sys.exit(1)
-          json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
-          print("✅ Secrets present and Google JSON parses.")
-          PY
-
-      - name: Run bot by calling src.main.main() (or run())
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "Running via importer-caller (no reliance on __main__ guard)..."
-          python -X faulthandler - << 'PY' 2>&1 | tee run_output.log
-          import os
-          import src.main as m
-
-          print("Loaded module: src.main")
-          public = [name for name in dir(m) if not name.startswith("_")]
-          print("Public symbols:", public)
-
-          # Call main() if present, else run()
-          if hasattr(m, "main") and callable(getattr(m, "main")):
-              print("Calling src.main.main() ...")
-              m.main()
-              print("✅ src.main.main() finished")
-          elif hasattr(m, "run") and callable(getattr(m, "run")):
-              print("Calling src.main.run() ...")
-              m.run()
-              print("✅ src.main.run() finished")
-          else:
-              raise SystemExit("❌ src.main has no callable main() or run() — nothing to execute.")
-          PY
-
-      - name: Show run output file size and last lines
-        if: always()
-        shell: bash
-        run: |
-          echo "===== run_output.log file info ====="
-          ls -la run_output.log || true
-          echo ""
-          echo "===== LAST 200 LINES (run_output.log) ====="
-          tail -n 200 run_output.log || true
-
-      - name: Upload run log artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: run_output
-          path: run_output.log
+          python -m src.main
