@@ -1,30 +1,3 @@
-      - name: Run bot (auto-detect entrypoint)
+      - name: Run bot
         run: |
-          set -e
-
-          echo "Repo tree (top level):"
-          ls -la
-
-          echo "Python files in src:"
-          find src -maxdepth 3 -type f -name "*.py" -print
-
-          # 1) If src/__main__.py exists, that's the cleanest entrypoint
-          if [ -f src/__main__.py ]; then
-            echo "Running: python -m src"
-            python -m src
-            exit 0
-          fi
-
-          # 2) Otherwise find the first file that looks like a runnable script
-          ENTRY=$(grep -RIl --include="*.py" "if __name__ == \"__main__\"" src | head -n 1 || true)
-
-          if [ -n "$ENTRY" ]; then
-            echo "Running detected entrypoint: $ENTRY"
-            python "$ENTRY"
-            exit 0
-          fi
-
-          # 3) Last resort: show you what’s in src and fail clearly
-          echo "❌ Could not auto-detect an entrypoint."
-          echo "Open the src/ folder and tell me which file is meant to run (often bot.py/app.py/pipeline.py)."
-          exit 1
+          python src/Main.py
