@@ -1,0 +1,40 @@
+{
+  "region": "uk",
+  "odds_markets": [
+    "h2h",
+    "totals",
+    "btts",
+    "alternate_totals_cards"
+  ],
+  "target_leagues": [
+    "Premier League",
+    "La Liga",
+    "Bundesliga",
+    "Serie A",
+    "Ligue 1",
+    "UEFA Champions League",
+    "UEFA Europa League",
+    "UEFA Europa Conference League",
+    "Championship",
+    "League One",
+    "League Two",
+    "Segunda Divisi\u00f3n",
+    "Scottish Premiership",
+    "Spain Segunda",
+    "Spain LaLiga2",
+    "Primera Divisi\u00f3n RFEF"
+  ],
+  "football_data_csv": {
+    "E0": "https://www.football-data.co.uk/mmz4281/2526/E0.csv",
+    "E1": "https://www.football-data.co.uk/mmz4281/2526/E1.csv",
+    "E2": "https://www.football-data.co.uk/mmz4281/2526/E2.csv",
+    "E3": "https://www.football-data.co.uk/mmz4281/2526/E3.csv",
+    "SP1": "https://www.football-data.co.uk/mmz4281/2526/SP1.csv",
+    "SP2": "https://www.football-data.co.uk/mmz4281/2526/SP2.csv",
+    "D1": "https://www.football-data.co.uk/mmz4281/2526/D1.csv",
+    "I1": "https://www.football-data.co.uk/mmz4281/2526/I1.csv",
+    "F1": "https://www.football-data.co.uk/mmz4281/2526/F1.csv",
+    "SC0": "https://www.football-data.co.uk/mmz4281/2526/SC0.csv"
+  },
+  "rolling_window_matches": 12
+}
