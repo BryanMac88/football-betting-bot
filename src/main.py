@@ -179,7 +179,17 @@ class FD:
 # ================= RANKING HELPERS =================
 CORE_COLS = ["utcDate", "league", "home", "away"]
 
-def top_n_for_market(probs_df: pd.DataFrame, prob_col: str, tab_name: str, bet_label: str, top_n: int = TOP_N) -> pd.DataFrame:
+
+def top_n_for_market(
+    probs_df: pd.DataFrame,
+    prob_col: str,
+    bet_label: str,
+    top_n: int = TOP_N
+) -> pd.DataFrame:
+    """
+    Returns a Top-N table for a single probability column.
+    IMPORTANT: does NOT add 'rank' (we add rank only at final write stage).
+    """
     if probs_df is None or probs_df.empty:
         return pd.DataFrame()
 
@@ -190,28 +200,47 @@ def top_n_for_market(probs_df: pd.DataFrame, prob_col: str, tab_name: str, bet_l
     df = df.dropna(subset=["prob"])
     df = df.sort_values(["prob", "utcDate"], ascending=[False, True]).head(top_n).reset_index(drop=True)
     df.insert(0, "rank", range(1, len(df) + 1))
-    return df
+    return df[["rank", "utcDate", "league", "home", "away", "bet", "prob"]]
 
 
 def build_top20_mix(probs_df: pd.DataFrame, top_k: int = TOP_MIX) -> pd.DataFrame:
+    """
+    Combine all candidate bet types and return a single Top-K mixture.
+    We REMOVE any existing rank columns before adding our own.
+    """
     if probs_df is None or probs_df.empty:
         return pd.DataFrame()
 
-    candidates: List[pd.DataFrame] = []
+    parts = []
 
-    candidates.append(top_n_for_market(probs_df, "p_home", "Top10_Home_Win", "HOME WIN", top_n=len(probs_df)))
-    candidates.append(top_n_for_market(probs_df, "p_away", "Top10_Away_Win", "AWAY WIN", top_n=len(probs_df)))
-    candidates.append(top_n_for_market(probs_df, "p_draw", "Top10_Draw", "DRAW", top_n=len(probs_df)))
-    candidates.append(top_n_for_market(probs_df, "p_btts_yes", "Top10_BTTS_Yes", "BTTS YES", top_n=len(probs_df)))
-    candidates.append(top_n_for_market(probs_df, "p_btts_no", "Top10_BTTS_No", "BTTS NO", top_n=len(probs_df)))
-    candidates.append(top_n_for_market(probs_df, "p_over_1_5", "Top10_Over_1_5", "OVER 1.5", top_n=len(probs_df)))
-    candidates.append(top_n_for_market(probs_df, "p_over_2_5", "Top10_Over_2_5", "OVER 2.5", top_n=len(probs_df)))
+    # Build full candidate lists (not just Top10) then take Top20 overall
+    def _all_for(col: str, label: str) -> pd.DataFrame:
+        d = probs_df[CORE_COLS + [col]].copy()
+        d = d.rename(columns={col: "prob"})
+        d["bet"] = label
+        d["prob"] = pd.to_numeric(d["prob"], errors="coerce")
+        d = d.dropna(subset=["prob"])
+        return d[["utcDate", "league", "home", "away", "bet", "prob"]]
 
-    mix = pd.concat(candidates, ignore_index=True)
-    # Unique by fixture + bet type
+    parts.append(_all_for("p_home", "HOME WIN"))
+    parts.append(_all_for("p_away", "AWAY WIN"))
+    parts.append(_all_for("p_draw", "DRAW"))
+    parts.append(_all_for("p_btts_yes", "BTTS YES"))
+    parts.append(_all_for("p_btts_no", "BTTS NO"))
+    parts.append(_all_for("p_over_1_5", "OVER 1.5"))
+    parts.append(_all_for("p_over_2_5", "OVER 2.5"))
+
+    mix = pd.concat(parts, ignore_index=True)
+
+    # Unique by fixture + bet
     mix = mix.drop_duplicates(subset=["utcDate", "home", "away", "bet"])
+
+    # Sort & take top_k
     mix = mix.sort_values(["prob", "utcDate"], ascending=[False, True]).head(top_k).reset_index(drop=True)
+
+    # Add rank once
     mix.insert(0, "rank", range(1, len(mix) + 1))
+
     return mix[["rank", "utcDate", "league", "home", "away", "bet", "prob"]]
 
 
@@ -277,13 +306,19 @@ def main():
     # Always write core tabs (even if empty)
     write_df("Fixtures", fx_df)
 
+    keep_tabs = [
+        "Fixtures", "Team_Form", "Picks", "Value_Bets",
+        "Top10_Home_Win", "Top10_Away_Win", "Top10_Draw",
+        "Top10_BTTS_Yes", "Top10_BTTS_No",
+        "Top10_Over_1_5", "Top10_Over_2_5",
+        "Top20_Mix",
+    ]
+
     if rs_df.empty:
-        # Write empty tabs
         write_df("Team_Form", pd.DataFrame())
         write_df("Picks", pd.DataFrame())
         write_df("Value_Bets", pd.DataFrame())
 
-        # Write empty ranking tabs
         write_df("Top10_Home_Win", pd.DataFrame())
         write_df("Top10_Away_Win", pd.DataFrame())
         write_df("Top10_Draw", pd.DataFrame())
@@ -293,18 +328,11 @@ def main():
         write_df("Top10_Over_2_5", pd.DataFrame())
         write_df("Top20_Mix", pd.DataFrame())
 
-        keep = [
-            "Fixtures", "Team_Form", "Picks", "Value_Bets",
-            "Top10_Home_Win", "Top10_Away_Win", "Top10_Draw",
-            "Top10_BTTS_Yes", "Top10_BTTS_No",
-            "Top10_Over_1_5", "Top10_Over_2_5",
-            "Top20_Mix",
-        ]
-        set_visible_tabs(keep)
+        set_visible_tabs(keep_tabs)
         log("=== DONE (no results) ===")
         return
 
-    # ---------- TEAM FORM (safe join: no overlapping columns) ----------
+    # ---------- TEAM FORM (safe join) ----------
     home = (
         rs_df.groupby("home")[["hg", "ag"]]
         .mean()
@@ -333,7 +361,6 @@ def main():
         write_df("Picks", pd.DataFrame())
         write_df("Value_Bets", pd.DataFrame())
 
-        # ranking tabs empty
         write_df("Top10_Home_Win", pd.DataFrame())
         write_df("Top10_Away_Win", pd.DataFrame())
         write_df("Top10_Draw", pd.DataFrame())
@@ -343,19 +370,12 @@ def main():
         write_df("Top10_Over_2_5", pd.DataFrame())
         write_df("Top20_Mix", pd.DataFrame())
 
-        keep = [
-            "Fixtures", "Team_Form", "Picks", "Value_Bets",
-            "Top10_Home_Win", "Top10_Away_Win", "Top10_Draw",
-            "Top10_BTTS_Yes", "Top10_BTTS_No",
-            "Top10_Over_1_5", "Top10_Over_2_5",
-            "Top20_Mix",
-        ]
-        set_visible_tabs(keep)
+        set_visible_tabs(keep_tabs)
         log("=== DONE (no fixtures) ===")
         return
 
     probs_rows: List[Dict[str, Any]] = []
-    form_idx = form  # index is team name
+    form_idx = form  # indexed by team name
 
     for _, r in fx_df.iterrows():
         h = r.get("home")
@@ -372,16 +392,14 @@ def main():
 
     probs_df = pd.DataFrame(probs_rows)
 
-    # ---------- Picks tab (show all key probabilities) ----------
-    picks_df = probs_df.copy()
-    # 1X2 pick
+    # ---------- Picks tab ----------
     def _pick_1x2(row: pd.Series) -> Tuple[str, float]:
         opts = [("HOME", row["p_home"]), ("DRAW", row["p_draw"]), ("AWAY", row["p_away"])]
         best = max(opts, key=lambda x: float(x[1]))
         return best[0], float(best[1])
 
     picks = []
-    for _, row in picks_df.iterrows():
+    for _, row in probs_df.iterrows():
         pick, pbest = _pick_1x2(row)
         picks.append({
             "utcDate": row["utcDate"],
@@ -404,32 +422,24 @@ def main():
     picks_out = pd.DataFrame(picks).sort_values(["p_1x2", "utcDate"], ascending=[False, True])
     write_df("Picks", picks_out)
 
-    # ---------- Value_Bets (still empty in free/no-odds mode) ----------
+    # ---------- Value_Bets (still empty on free/no-odds) ----------
     write_df("Value_Bets", pd.DataFrame())
 
     # ---------- Top 10 per market ----------
-    write_df("Top10_Home_Win", top_n_for_market(probs_df, "p_home", "Top10_Home_Win", "HOME WIN", TOP_N))
-    write_df("Top10_Away_Win", top_n_for_market(probs_df, "p_away", "Top10_Away_Win", "AWAY WIN", TOP_N))
-    write_df("Top10_Draw", top_n_for_market(probs_df, "p_draw", "Top10_Draw", "DRAW", TOP_N))
-    write_df("Top10_BTTS_Yes", top_n_for_market(probs_df, "p_btts_yes", "Top10_BTTS_Yes", "BTTS YES", TOP_N))
-    write_df("Top10_BTTS_No", top_n_for_market(probs_df, "p_btts_no", "Top10_BTTS_No", "BTTS NO", TOP_N))
-    write_df("Top10_Over_1_5", top_n_for_market(probs_df, "p_over_1_5", "Top10_Over_1_5", "OVER 1.5", TOP_N))
-    write_df("Top10_Over_2_5", top_n_for_market(probs_df, "p_over_2_5", "Top10_Over_2_5", "OVER 2.5", TOP_N))
+    write_df("Top10_Home_Win", top_n_for_market(probs_df, "p_home", "HOME WIN", TOP_N))
+    write_df("Top10_Away_Win", top_n_for_market(probs_df, "p_away", "AWAY WIN", TOP_N))
+    write_df("Top10_Draw", top_n_for_market(probs_df, "p_draw", "DRAW", TOP_N))
+    write_df("Top10_BTTS_Yes", top_n_for_market(probs_df, "p_btts_yes", "BTTS YES", TOP_N))
+    write_df("Top10_BTTS_No", top_n_for_market(probs_df, "p_btts_no", "BTTS NO", TOP_N))
+    write_df("Top10_Over_1_5", top_n_for_market(probs_df, "p_over_1_5", "OVER 1.5", TOP_N))
+    write_df("Top10_Over_2_5", top_n_for_market(probs_df, "p_over_2_5", "OVER 2.5", TOP_N))
 
-    # ---------- Top 20 mixture ----------
+    # ---------- Top 20 mixture (FIXED) ----------
     mix_df = build_top20_mix(probs_df, TOP_MIX)
     write_df("Top20_Mix", mix_df)
 
     # ---------- CLEAN UP TABS ----------
-    keep = [
-        "Fixtures", "Team_Form", "Picks", "Value_Bets",
-        "Top10_Home_Win", "Top10_Away_Win", "Top10_Draw",
-        "Top10_BTTS_Yes", "Top10_BTTS_No",
-        "Top10_Over_1_5", "Top10_Over_2_5",
-        "Top20_Mix",
-    ]
-    set_visible_tabs(keep)
-
+    set_visible_tabs(keep_tabs)
     log("=== DONE ===")
 
 
