@@ -1,55 +1,30 @@
-name: Test football bot
-
-on:
-  workflow_dispatch:
-  # Optional daily run at 10:00 UTC
-  # schedule:
-  #   - cron: "0 10 * * *"
-
-jobs:
-  run:
-    runs-on: ubuntu-latest
-
-    env:
-      ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
-      SHEET_ID: ${{ secrets.SHEET_ID }}
-      GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-      REGION: uk
-      BANKROLL: "100"
-      KELLY_FRACTION: "0.25"
-      MIN_EDGE: "0.03"
-
-    steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install dependencies
+      - name: Run bot (auto-detect entrypoint)
         run: |
-          python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          set -e
 
-      - name: Sanity check secrets exist
-        run: |
-          python - << 'PY'
-          import os, sys, json
-          missing = [k for k in ["ODDS_API_KEY","SHEET_ID","GOOGLE_SERVICE_ACCOUNT_JSON"] if not os.getenv(k)]
-          if missing:
-            print("Missing secrets:", missing)
-            sys.exit(1)
-          # validate JSON parses
-          json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
-          print("Secrets look good.")
-          PY
+          echo "Repo tree (top level):"
+          ls -la
 
-      - name: Run bot
-        run: |
-          # Try common entrypoints; keep the one that matches your repo
-          if [ -f main.py ]; then python main.py; \
-          elif [ -f run.py ]; then python run.py; \
-          elif [ -f update.py ]; then python update.py; \
-          else echo "No entrypoint found (main.py/run.py/update.py)."; ls -la; exit 1; fi
+          echo "Python files in src:"
+          find src -maxdepth 3 -type f -name "*.py" -print
+
+          # 1) If src/__main__.py exists, that's the cleanest entrypoint
+          if [ -f src/__main__.py ]; then
+            echo "Running: python -m src"
+            python -m src
+            exit 0
+          fi
+
+          # 2) Otherwise find the first file that looks like a runnable script
+          ENTRY=$(grep -RIl --include="*.py" "if __name__ == \"__main__\"" src | head -n 1 || true)
+
+          if [ -n "$ENTRY" ]; then
+            echo "Running detected entrypoint: $ENTRY"
+            python "$ENTRY"
+            exit 0
+          fi
+
+          # 3) Last resort: show you what’s in src and fail clearly
+          echo "❌ Could not auto-detect an entrypoint."
+          echo "Open the src/ folder and tell me which file is meant to run (often bot.py/app.py/pipeline.py)."
+          exit 1
