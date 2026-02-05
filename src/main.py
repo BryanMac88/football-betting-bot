@@ -52,12 +52,16 @@ def poisson(lam: float, k: int) -> float:
 
 
 def match_probs(lh: float, la: float) -> Dict[str, float]:
+    """
+    Poisson model score matrix -> 1X2, BTTS, Over/Under 1.5 and 2.5
+    """
     ph = [poisson(lh, i) for i in range(MAX_GOALS + 1)]
     pa = [poisson(la, j) for j in range(MAX_GOALS + 1)]
 
     p_home = p_draw = p_away = 0.0
     p_btts = 0.0
     p_over15 = 0.0
+    p_over25 = 0.0
 
     for i in range(MAX_GOALS + 1):
         for j in range(MAX_GOALS + 1):
@@ -73,15 +77,22 @@ def match_probs(lh: float, la: float) -> Dict[str, float]:
             if i > 0 and j > 0:
                 p_btts += p
 
-            if i + j > 1:
+            tg = i + j
+            if tg > 1:
                 p_over15 += p
+            if tg > 2:
+                p_over25 += p
 
     return {
         "p_home": p_home,
         "p_draw": p_draw,
         "p_away": p_away,
         "p_btts_yes": p_btts,
+        "p_btts_no": 1 - p_btts,
         "p_over_1_5": p_over15,
+        "p_under_1_5": 1 - p_over15,
+        "p_over_2_5": p_over25,
+        "p_under_2_5": 1 - p_over25,
     }
 
 
@@ -222,7 +233,6 @@ def main():
     # Always write the four tabs (even if empty)
     write_df("Fixtures", fx_df)
 
-    # If no results, we can't build team form
     if rs_df.empty:
         write_df("Team_Form", pd.DataFrame())
         write_df("Picks", pd.DataFrame())
@@ -231,7 +241,7 @@ def main():
         log("=== DONE (no results) ===")
         return
 
-    # ---------- TEAM FORM (FIXED: no overlapping columns) ----------
+    # ---------- TEAM FORM (safe join) ----------
     home = (
         rs_df.groupby("home")[["hg", "ag"]]
         .mean()
@@ -242,16 +252,10 @@ def main():
         .mean()
         .rename(columns={"hg": "away_hg", "ag": "away_ag"})
     )
-
-    # Join now safe (no overlaps)
     form = home.join(away, how="outer").fillna(0.0)
 
-    # Simple strength metrics
-    # home_hg = avg goals scored at home, home_ag = avg conceded at home
-    # away_ag = avg conceded away, away_hg = avg scored away (naming is just consistent here)
     league_home_gf = form["home_hg"].replace(0, pd.NA).mean()
     league_away_gf = form["away_hg"].replace(0, pd.NA).mean()
-
     league_home_gf = float(league_home_gf) if league_home_gf == league_home_gf else BASE_HOME
     league_away_gf = float(league_away_gf) if league_away_gf == league_away_gf else BASE_AWAY
 
@@ -262,7 +266,6 @@ def main():
     write_df("Team_Form", team_form_df)
 
     # ---------- PICKS ----------
-    picks: List[Dict[str, Any]] = []
     if fx_df.empty:
         write_df("Picks", pd.DataFrame())
         write_df("Value_Bets", pd.DataFrame())
@@ -270,8 +273,8 @@ def main():
         log("=== DONE (no fixtures) ===")
         return
 
-    # Use team form if available, otherwise fallback to baseline
-    form_idx = form  # index = team names
+    picks: List[Dict[str, Any]] = []
+    form_idx = form  # indexed by team names
 
     for _, r in fx_df.iterrows():
         h = r.get("home")
@@ -285,7 +288,7 @@ def main():
 
         p = match_probs(lh, la)
 
-        best = max(
+        best_1x2 = max(
             [("HOME", p["p_home"]), ("DRAW", p["p_draw"]), ("AWAY", p["p_away"])],
             key=lambda x: x[1],
         )
@@ -294,18 +297,22 @@ def main():
             "utcDate": r.get("utcDate"),
             "home": h,
             "away": a,
-            "pick_1x2": best[0],
-            "p_1x2": round(float(best[1]), 3),
+            "pick_1x2": best_1x2[0],
+            "p_1x2": round(float(best_1x2[1]), 3),
             "p_btts_yes": round(float(p["p_btts_yes"]), 3),
+
             "p_over_1_5": round(float(p["p_over_1_5"]), 3),
+            "p_under_1_5": round(float(p["p_under_1_5"]), 3),
+
+            "p_over_2_5": round(float(p["p_over_2_5"]), 3),
+            "p_under_2_5": round(float(p["p_under_2_5"]), 3),
         })
 
     picks_df = pd.DataFrame(picks).sort_values("p_1x2", ascending=False)
     write_df("Picks", picks_df)
 
     # ---------- VALUE BETS ----------
-    # We are not pulling bookmaker odds in this free setup, so keep it empty for now.
-    # When you want, we can add odds again carefully (without hitting rate limits).
+    # Still blank on fully-free setup (no bookmaker odds feed)
     write_df("Value_Bets", pd.DataFrame())
 
     # ---------- CLEAN UP TABS ----------
