@@ -23,7 +23,10 @@ COMP_CODES = [
 ]
 
 SLEEP_SECONDS = 7.0
-DAYS_AHEAD = 7
+
+# Only look ahead 3 days for fixtures
+DAYS_AHEAD = 3
+
 HISTORY_DAYS = 210
 MAX_GOALS = 10
 
@@ -32,6 +35,10 @@ BASE_AWAY = 1.20
 
 TOP_N = 10
 TOP_MIX = 20
+
+# Enforce unique teams in Top10 lists + Top20 mix
+UNIQUE_TEAMS_PER_TOP10 = True
+UNIQUE_TEAMS_IN_TOP20 = True
 
 
 # ================= UTILS =================
@@ -180,16 +187,41 @@ class FD:
 CORE_COLS = ["utcDate", "league", "home", "away"]
 
 
+def _dedupe_teams(df: pd.DataFrame, limit: int) -> pd.DataFrame:
+    """
+    Keep rows such that each team appears at most once (home or away).
+    Assumes df is already sorted best->worst.
+    """
+    used = set()
+    kept_rows = []
+
+    for _, r in df.iterrows():
+        h = r.get("home")
+        a = r.get("away")
+        if h in used or a in used:
+            continue
+        kept_rows.append(r)
+        if h:
+            used.add(h)
+        if a:
+            used.add(a)
+        if len(kept_rows) >= limit:
+            break
+
+    if not kept_rows:
+        return df.head(0)
+
+    out = pd.DataFrame(kept_rows).reset_index(drop=True)
+    return out
+
+
 def top_n_for_market(
     probs_df: pd.DataFrame,
     prob_col: str,
     bet_label: str,
-    top_n: int = TOP_N
+    top_n: int = TOP_N,
+    unique_teams: bool = UNIQUE_TEAMS_PER_TOP10,
 ) -> pd.DataFrame:
-    """
-    Returns a Top-N table for a single probability column.
-    IMPORTANT: does NOT add 'rank' (we add rank only at final write stage).
-    """
     if probs_df is None or probs_df.empty:
         return pd.DataFrame()
 
@@ -198,22 +230,26 @@ def top_n_for_market(
     df["bet"] = bet_label
     df["prob"] = pd.to_numeric(df["prob"], errors="coerce")
     df = df.dropna(subset=["prob"])
-    df = df.sort_values(["prob", "utcDate"], ascending=[False, True]).head(top_n).reset_index(drop=True)
+
+    df = df.sort_values(["prob", "utcDate"], ascending=[False, True]).reset_index(drop=True)
+
+    if unique_teams:
+        df = _dedupe_teams(df, top_n)
+    else:
+        df = df.head(top_n).reset_index(drop=True)
+
     df.insert(0, "rank", range(1, len(df) + 1))
     return df[["rank", "utcDate", "league", "home", "away", "bet", "prob"]]
 
 
-def build_top20_mix(probs_df: pd.DataFrame, top_k: int = TOP_MIX) -> pd.DataFrame:
+def build_top20_mix(probs_df: pd.DataFrame, top_k: int = TOP_MIX, unique_teams: bool = UNIQUE_TEAMS_IN_TOP20) -> pd.DataFrame:
     """
-    Combine all candidate bet types and return a single Top-K mixture.
-    We REMOVE any existing rank columns before adding our own.
+    Top20 mixture across all bet types.
+    If unique_teams=True, each team appears at most once in the Top20.
     """
     if probs_df is None or probs_df.empty:
         return pd.DataFrame()
 
-    parts = []
-
-    # Build full candidate lists (not just Top10) then take Top20 overall
     def _all_for(col: str, label: str) -> pd.DataFrame:
         d = probs_df[CORE_COLS + [col]].copy()
         d = d.rename(columns={col: "prob"})
@@ -222,25 +258,26 @@ def build_top20_mix(probs_df: pd.DataFrame, top_k: int = TOP_MIX) -> pd.DataFram
         d = d.dropna(subset=["prob"])
         return d[["utcDate", "league", "home", "away", "bet", "prob"]]
 
-    parts.append(_all_for("p_home", "HOME WIN"))
-    parts.append(_all_for("p_away", "AWAY WIN"))
-    parts.append(_all_for("p_draw", "DRAW"))
-    parts.append(_all_for("p_btts_yes", "BTTS YES"))
-    parts.append(_all_for("p_btts_no", "BTTS NO"))
-    parts.append(_all_for("p_over_1_5", "OVER 1.5"))
-    parts.append(_all_for("p_over_2_5", "OVER 2.5"))
+    parts = [
+        _all_for("p_home", "HOME WIN"),
+        _all_for("p_away", "AWAY WIN"),
+        _all_for("p_draw", "DRAW"),
+        _all_for("p_btts_yes", "BTTS YES"),
+        _all_for("p_btts_no", "BTTS NO"),
+        _all_for("p_over_1_5", "OVER 1.5"),
+        _all_for("p_over_2_5", "OVER 2.5"),
+    ]
 
     mix = pd.concat(parts, ignore_index=True)
-
-    # Unique by fixture + bet
     mix = mix.drop_duplicates(subset=["utcDate", "home", "away", "bet"])
+    mix = mix.sort_values(["prob", "utcDate"], ascending=[False, True]).reset_index(drop=True)
 
-    # Sort & take top_k
-    mix = mix.sort_values(["prob", "utcDate"], ascending=[False, True]).head(top_k).reset_index(drop=True)
+    if unique_teams:
+        mix = _dedupe_teams(mix, top_k)
+    else:
+        mix = mix.head(top_k).reset_index(drop=True)
 
-    # Add rank once
     mix.insert(0, "rank", range(1, len(mix) + 1))
-
     return mix[["rank", "utcDate", "league", "home", "away", "bet", "prob"]]
 
 
@@ -318,7 +355,6 @@ def main():
         write_df("Team_Form", pd.DataFrame())
         write_df("Picks", pd.DataFrame())
         write_df("Value_Bets", pd.DataFrame())
-
         write_df("Top10_Home_Win", pd.DataFrame())
         write_df("Top10_Away_Win", pd.DataFrame())
         write_df("Top10_Draw", pd.DataFrame())
@@ -327,12 +363,11 @@ def main():
         write_df("Top10_Over_1_5", pd.DataFrame())
         write_df("Top10_Over_2_5", pd.DataFrame())
         write_df("Top20_Mix", pd.DataFrame())
-
         set_visible_tabs(keep_tabs)
         log("=== DONE (no results) ===")
         return
 
-    # ---------- TEAM FORM (safe join) ----------
+    # ---------- TEAM FORM ----------
     home = (
         rs_df.groupby("home")[["hg", "ag"]]
         .mean()
@@ -356,11 +391,9 @@ def main():
     team_form_df = form.reset_index().rename(columns={"index": "team"})
     write_df("Team_Form", team_form_df)
 
-    # ---------- Build probabilities for fixtures ----------
     if fx_df.empty:
         write_df("Picks", pd.DataFrame())
         write_df("Value_Bets", pd.DataFrame())
-
         write_df("Top10_Home_Win", pd.DataFrame())
         write_df("Top10_Away_Win", pd.DataFrame())
         write_df("Top10_Draw", pd.DataFrame())
@@ -369,13 +402,13 @@ def main():
         write_df("Top10_Over_1_5", pd.DataFrame())
         write_df("Top10_Over_2_5", pd.DataFrame())
         write_df("Top20_Mix", pd.DataFrame())
-
         set_visible_tabs(keep_tabs)
         log("=== DONE (no fixtures) ===")
         return
 
+    # ---------- Probabilities for fixtures ----------
     probs_rows: List[Dict[str, Any]] = []
-    form_idx = form  # indexed by team name
+    form_idx = form
 
     for _, r in fx_df.iterrows():
         h = r.get("home")
@@ -422,10 +455,10 @@ def main():
     picks_out = pd.DataFrame(picks).sort_values(["p_1x2", "utcDate"], ascending=[False, True])
     write_df("Picks", picks_out)
 
-    # ---------- Value_Bets (still empty on free/no-odds) ----------
+    # ---------- Value_Bets ----------
     write_df("Value_Bets", pd.DataFrame())
 
-    # ---------- Top 10 per market ----------
+    # ---------- Top 10 per market (unique teams enforced) ----------
     write_df("Top10_Home_Win", top_n_for_market(probs_df, "p_home", "HOME WIN", TOP_N))
     write_df("Top10_Away_Win", top_n_for_market(probs_df, "p_away", "AWAY WIN", TOP_N))
     write_df("Top10_Draw", top_n_for_market(probs_df, "p_draw", "DRAW", TOP_N))
@@ -434,8 +467,8 @@ def main():
     write_df("Top10_Over_1_5", top_n_for_market(probs_df, "p_over_1_5", "OVER 1.5", TOP_N))
     write_df("Top10_Over_2_5", top_n_for_market(probs_df, "p_over_2_5", "OVER 2.5", TOP_N))
 
-    # ---------- Top 20 mixture (FIXED) ----------
-    mix_df = build_top20_mix(probs_df, TOP_MIX)
+    # ---------- Top 20 mixture (unique teams enforced) ----------
+    mix_df = build_top20_mix(probs_df, TOP_MIX, unique_teams=UNIQUE_TEAMS_IN_TOP20)
     write_df("Top20_Mix", mix_df)
 
     # ---------- CLEAN UP TABS ----------
