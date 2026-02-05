@@ -1,8 +1,83 @@
-      - name: Debug repo files
+name: Football Betting Bot
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 10 * * *"   # 10:00 UTC daily
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+
+    env:
+      ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+      SHEET_ID: ${{ secrets.SHEET_ID }}
+      GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+      REGION: uk
+      BANKROLL: "100"
+      KELLY_FRACTION: "0.25"
+      MIN_EDGE: "0.03"
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
         run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Validate secrets
+        run: |
+          python - << 'PY'
+          import os, json, sys
+          required = ["ODDS_API_KEY", "SHEET_ID", "GOOGLE_SERVICE_ACCOUNT_JSON"]
+          missing = [k for k in required if not os.getenv(k)]
+          if missing:
+              print("❌ Missing secrets:", missing)
+              sys.exit(1)
+          json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
+          print("✅ Secrets OK")
+          PY
+
+      - name: Run betting bot (auto-detect Main.py)
+        shell: bash
+        run: |
+          set -e
+
+          echo "Searching for entrypoint..."
+
+          # Prefer src/Main.py if it exists (your intended location)
+          if [ -f "src/Main.py" ]; then
+            echo "Found src/Main.py"
+            python "src/Main.py"
+            exit 0
+          fi
+
+          # Otherwise accept src/main.py
+          if [ -f "src/main.py" ]; then
+            echo "Found src/main.py"
+            python "src/main.py"
+            exit 0
+          fi
+
+          # Otherwise find any Main.py / main.py anywhere up to 5 levels deep
+          ENTRY=$(find . -maxdepth 5 -type f \( -iname "main.py" -o -iname "Main.py" \) | head -n 1 || true)
+
+          if [ -n "$ENTRY" ]; then
+            echo "Found entrypoint: $ENTRY"
+            python "$ENTRY"
+            exit 0
+          fi
+
+          echo "❌ Could not find Main.py or main.py anywhere."
           echo "Top level:"
           ls -la
-          echo "src folder (if it exists):"
+          echo "src folder (if present):"
           ls -la src || true
-          echo "Find any Main.py / main.py:"
-          find . -maxdepth 4 -type f \( -iname "main.py" -o -iname "Main.py" \) -print
+          exit 1
