@@ -39,11 +39,12 @@ jobs:
           echo "Python files under src (max depth 3):"
           find src -maxdepth 3 -type f -name "*.py" -print || true
           echo ""
-          echo "First 120 lines of src/main.py (if present):"
+          echo "Preview src/main.py (first 200 lines):"
           if [ -f src/main.py ]; then
-            nl -ba src/main.py | sed -n '1,120p'
+            nl -ba src/main.py | sed -n '1,200p'
           else
-            echo "src/main.py not found"
+            echo "❌ src/main.py not found"
+            exit 1
           fi
 
       - name: Set up Python
@@ -56,7 +57,6 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           python -V
-          pip -V
 
       - name: Validate secrets (won't print secrets)
         run: |
@@ -69,17 +69,33 @@ jobs:
               sys.exit(1)
           json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
           print("✅ Secrets present and Google JSON parses.")
-          print("SHEET_ID length:", len(os.environ["SHEET_ID"]))
-          print("REGION:", os.environ.get("REGION"))
           PY
 
-      - name: Run betting bot (capture output and REAL exit code)
+      - name: Run bot by calling src.main.main() (or run())
         shell: bash
         run: |
           set -euo pipefail
-          echo "Running: python -X faulthandler -m src.main"
-          python -X faulthandler -m src.main 2>&1 | tee run_output.log
-          echo "✅ Python finished OK"
+          echo "Running via importer-caller (no reliance on __main__ guard)..."
+          python -X faulthandler - << 'PY' 2>&1 | tee run_output.log
+          import os
+          import src.main as m
+
+          print("Loaded module: src.main")
+          public = [name for name in dir(m) if not name.startswith("_")]
+          print("Public symbols:", public)
+
+          # Call main() if present, else run()
+          if hasattr(m, "main") and callable(getattr(m, "main")):
+              print("Calling src.main.main() ...")
+              m.main()
+              print("✅ src.main.main() finished")
+          elif hasattr(m, "run") and callable(getattr(m, "run")):
+              print("Calling src.main.run() ...")
+              m.run()
+              print("✅ src.main.run() finished")
+          else:
+              raise SystemExit("❌ src.main has no callable main() or run() — nothing to execute.")
+          PY
 
       - name: Show run output file size and last lines
         if: always()
