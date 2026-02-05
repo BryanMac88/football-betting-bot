@@ -14,15 +14,36 @@ jobs:
       SHEET_ID: ${{ secrets.SHEET_ID }}
       GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
 
-      # Config defaults (you can change these later via repo secrets if you want)
       REGION: uk
       BANKROLL: "100"
       KELLY_FRACTION: "0.25"
       MIN_EDGE: "0.03"
 
+      # Make sure prints show up immediately in GitHub Actions logs
+      PYTHONUNBUFFERED: "1"
+
+      # Many projects use LOG_LEVEL if implemented
+      LOG_LEVEL: "DEBUG"
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
+
+      - name: Show repo structure
+        shell: bash
+        run: |
+          set -e
+          echo "Top level:"
+          ls -la
+          echo ""
+          echo "src:"
+          ls -la src || true
+          echo ""
+          echo "Python files under src (max depth 3):"
+          find src -maxdepth 3 -type f -name "*.py" -print || true
+          echo ""
+          echo "requirements.txt:"
+          cat requirements.txt || true
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -34,64 +55,41 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Validate secrets and environment
+      - name: Validate secrets (won't print secrets)
         run: |
           python - << 'PY'
           import os, json, sys
-
           required = ["ODDS_API_KEY", "SHEET_ID", "GOOGLE_SERVICE_ACCOUNT_JSON"]
           missing = [k for k in required if not os.getenv(k)]
           if missing:
               print("❌ Missing required GitHub secrets:", missing)
-              print("Go to: Repo → Settings → Secrets and variables → Actions")
               sys.exit(1)
 
-          # Validate that the Google JSON secret is valid JSON
           try:
               json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
           except Exception as e:
               print("❌ GOOGLE_SERVICE_ACCOUNT_JSON is not valid JSON:", e)
               sys.exit(1)
 
-          # Optional config sanity checks
-          for k in ["REGION", "BANKROLL", "KELLY_FRACTION", "MIN_EDGE"]:
-              if not os.getenv(k):
-                  print(f"❌ Missing env var {k} (should be set in workflow env)")
-                  sys.exit(1)
-
-          print("✅ Secrets and env look OK")
+          print("✅ Secrets present and Google JSON parses.")
           PY
 
-      - name: Verify src package structure
+      - name: Run betting bot (with captured output)
         shell: bash
         run: |
           set -e
-          echo "Top-level files:"
-          ls -la
+          echo "Running: python -m src.main"
+          python -m src.main 2>&1 | tee run_output.log
 
-          if [ ! -d "src" ]; then
-            echo "❌ No src/ directory found."
-            exit 1
-          fi
-
-          echo "src contents:"
-          ls -la src
-
-          if [ ! -f "src/__init__.py" ]; then
-            echo "❌ src/__init__.py missing. This is required for python -m src.main."
-            echo "But you said it already exists—if not, create it as an empty file."
-            exit 1
-          fi
-
-          if [ ! -f "src/main.py" ]; then
-            echo "❌ src/main.py not found."
-            echo "These are the python files in src:"
-            find src -maxdepth 3 -type f -name "*.py" -print
-            exit 1
-          fi
-
-          echo "✅ src package looks OK"
-
-      - name: Run betting bot
+      - name: Show last 200 lines of run output
+        if: always()
         run: |
-          python -m src.main
+          echo "===== LAST 200 LINES (run_output.log) ====="
+          tail -n 200 run_output.log || true
+
+      - name: Upload run log artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run_output
+          path: run_output.log
