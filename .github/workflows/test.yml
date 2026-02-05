@@ -1,3 +1,0 @@
-      - name: Run bot
-        run: |
-          python src/Main.py
