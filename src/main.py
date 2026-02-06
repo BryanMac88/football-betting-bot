@@ -98,27 +98,121 @@ def poisson(lam: float, k: int) -> float:
     return math.exp(-lam) * (lam ** k) / math.factorial(k)
 
 
+# ================= SMART SCORE V2 =================
+def market_weight(bet: str) -> float:
+    """
+    Small weights so noisy markets don't dominate Top20.
+    """
+    b = bet.upper()
+    if b in ("HOME WIN", "AWAY WIN"):
+        return 1.00
+    if b == "DRAW":
+        return 0.88
+    if b.startswith("DOUBLE CHANCE"):
+        return 0.92
+    if b in ("BTTS YES", "BTTS NO"):
+        return 0.94
+    if b.startswith("OVER ") or b.startswith("UNDER "):
+        return 0.92
+    if "CLEAN SHEET" in b or "WIN TO NIL" in b:
+        return 0.86
+    if "BTTS YES & OVER" in b or "BTTS NO & UNDER" in b:
+        return 0.88
+    if "DNB" in b:
+        return 0.93
+    return 0.90
+
+
+def smart_score_v2(
+    prob: float,
+    confidence: float,
+    bet: str,
+    lam_home: float,
+    lam_away: float,
+    league_base_total: float,
+) -> Tuple[float, float, float]:
+    """
+    Returns (smart_score, penalty, adj_factor)
+    - smart_score ranks bets
+    - penalty shows how much we penalized volatility
+    - adj_factor is the combined multiplier from signals
+    """
+    p = clamp(float(prob), 0.0, 1.0)
+    c = clamp(float(confidence), 0.0, 1.0)
+
+    tot = max(0.1, float(lam_home) + float(lam_away))
+    base_tot = max(0.1, float(league_base_total))
+    gd = float(lam_home) - float(lam_away)  # expected goal diff
+
+    # How "certain" the pick is (0 at 50/50, 1 at 0/1)
+    extremeness = abs(p - 0.5) * 2.0
+
+    # Volatility penalty: extreme picks with low confidence get pushed down
+    penalty = (extremeness ** 1.25) * (1.0 - c) * 0.28
+    penalty = clamp(penalty, 0.0, 0.22)
+
+    # Signal adjustments
+    adj = 1.0
+
+    b = bet.upper()
+
+    # Draw suppression when high total goals or big goal diff
+    if b == "DRAW":
+        # high totals reduce draw; large gd reduces draw
+        draw_suppress = 1.0 - clamp((tot / base_tot - 1.0) * 0.18, 0.0, 0.18)
+        draw_suppress *= (1.0 - clamp(abs(gd) * 0.10, 0.0, 0.20))
+        adj *= draw_suppress
+
+    # Home/Away win: boost if goal diff supports it
+    elif b == "HOME WIN":
+        adj *= (1.0 + clamp(gd * 0.08, -0.12, 0.18))
+    elif b == "AWAY WIN":
+        adj *= (1.0 + clamp((-gd) * 0.08, -0.12, 0.18))
+
+    # Overs/unders: align with expected total vs baseline
+    elif b.startswith("OVER "):
+        # if tot is above baseline, small boost
+        adj *= (1.0 + clamp((tot / base_tot - 1.0) * 0.10, -0.08, 0.10))
+    elif b.startswith("UNDER "):
+        # if tot is below baseline, small boost
+        adj *= (1.0 + clamp((1.0 - tot / base_tot) * 0.10, -0.08, 0.10))
+
+    # BTTS: likes balanced games (small gd) and decent total
+    elif b in ("BTTS YES", "BTTS NO"):
+        bal = 1.0 - clamp(abs(gd) * 0.10, 0.0, 0.12)
+        # BTTS YES slightly prefers higher totals; BTTS NO slightly prefers lower totals
+        if b == "BTTS YES":
+            tot_adj = 1.0 + clamp((tot / base_tot - 1.0) * 0.06, -0.06, 0.06)
+        else:
+            tot_adj = 1.0 + clamp((1.0 - tot / base_tot) * 0.06, -0.06, 0.06)
+        adj *= bal * tot_adj
+
+    # Cap adjustments to avoid silly boosts
+    adj = clamp(adj, 0.80, 1.18)
+
+    w = market_weight(bet)
+    score = (p * c) * w * adj * (1.0 - penalty)
+
+    return float(score), float(penalty), float(adj)
+
+
+# ================= GOAL MODEL =================
 def match_probs(lh: float, la: float) -> Dict[str, float]:
     ph = [poisson(lh, i) for i in range(MAX_GOALS + 1)]
     pa = [poisson(la, j) for j in range(MAX_GOALS + 1)]
 
     p_home = p_draw = p_away = 0.0
-
     p_btts_yes = 0.0
     p_over_0_5 = 0.0
     p_over_1_5 = 0.0
     p_over_2_5 = 0.0
     p_over_3_5 = 0.0
-
     p_home_over_0_5 = 0.0
     p_away_over_0_5 = 0.0
-
     p_home_cs = 0.0
     p_away_cs = 0.0
-
     p_home_win_to_nil = 0.0
     p_away_win_to_nil = 0.0
-
     p_btts_yes_over_2_5 = 0.0
     p_btts_no_under_2_5 = 0.0
 
@@ -169,10 +263,19 @@ def match_probs(lh: float, la: float) -> Dict[str, float]:
 
     p_btts_no = 1.0 - p_btts_yes
 
+    p_1x = p_home + p_draw
+    p_x2 = p_draw + p_away
+    p_12 = p_home + p_away
+
     return {
         "p_home": p_home,
         "p_draw": p_draw,
         "p_away": p_away,
+        "p_1x": p_1x,
+        "p_x2": p_x2,
+        "p_12": p_12,
+        "p_home_dnb_win": p_home,
+        "p_away_dnb_win": p_away,
         "p_btts_yes": p_btts_yes,
         "p_btts_no": p_btts_no,
         "p_over_0_5": p_over_0_5,
@@ -291,7 +394,11 @@ def shrink(mean_est: float, n: float, prior_mean: float, k: float = SHRINK_K) ->
 
 def compute_league_baselines(rs: pd.DataFrame) -> pd.DataFrame:
     g = rs.groupby("league")
-    return pd.DataFrame({"home_gf": g["hg"].mean(), "away_gf": g["ag"].mean(), "n": g.size()})
+    return pd.DataFrame({
+        "home_gf": g["hg"].mean(),
+        "away_gf": g["ag"].mean(),
+        "n": g.size(),
+    })
 
 
 def compute_team_indices(rs: pd.DataFrame, league_baselines: pd.DataFrame) -> pd.DataFrame:
@@ -427,8 +534,8 @@ def top_n_for_market(probs_df: pd.DataFrame, prob_col: str, bet_label: str, top_
     if probs_df is None or probs_df.empty:
         return pd.DataFrame()
 
-    cols = CORE_COLS + ["confidence", prob_col]
-    df = probs_df[cols].copy()
+    base_cols = CORE_COLS + ["confidence", "lambda_home", "lambda_away", "league_base_total", prob_col]
+    df = probs_df[base_cols].copy()
     df = df.rename(columns={prob_col: "prob"})
     df["bet"] = bet_label
 
@@ -436,7 +543,22 @@ def top_n_for_market(probs_df: pd.DataFrame, prob_col: str, bet_label: str, top_
     df["confidence"] = pd.to_numeric(df["confidence"], errors="coerce")
     df = df.dropna(subset=["prob"])
 
-    df["score"] = df["prob"] * df["confidence"].fillna(0.5)
+    scores = []
+    for _, r in df.iterrows():
+        sc, pen, adj = smart_score_v2(
+            prob=float(r["prob"]),
+            confidence=float(r["confidence"]),
+            bet=bet_label,
+            lam_home=float(r["lambda_home"]),
+            lam_away=float(r["lambda_away"]),
+            league_base_total=float(r["league_base_total"]),
+        )
+        scores.append((sc, pen, adj))
+
+    df["score"] = [s[0] for s in scores]
+    df["penalty"] = [s[1] for s in scores]
+    df["adj"] = [s[2] for s in scores]
+
     df = df.sort_values(["score", "prob", "utcDate"], ascending=[False, False, True]).reset_index(drop=True)
 
     if UNIQUE_TEAMS_PER_TOP10:
@@ -445,25 +567,41 @@ def top_n_for_market(probs_df: pd.DataFrame, prob_col: str, bet_label: str, top_
         df = df.head(top_n).reset_index(drop=True)
 
     df.insert(0, "rank", range(1, len(df) + 1))
-    return df[["rank", "utcDate", "league", "home", "away", "bet", "prob", "confidence", "score"]]
+    return df[["rank", "utcDate", "league", "home", "away", "bet", "prob", "confidence", "score", "adj", "penalty"]]
 
 
 def build_top20_mix(probs_df: pd.DataFrame, top_k: int = TOP_MIX) -> pd.DataFrame:
     """
-    Over 0.5 is excluded from the mix by design.
+    Over 0.5 excluded from the mix by design.
     """
     if probs_df is None or probs_df.empty:
         return pd.DataFrame()
 
     def _all_for(col: str, label: str) -> pd.DataFrame:
-        d = probs_df[CORE_COLS + ["confidence", col]].copy()
+        d = probs_df[CORE_COLS + ["confidence", "lambda_home", "lambda_away", "league_base_total", col]].copy()
         d = d.rename(columns={col: "prob"})
         d["bet"] = label
         d["prob"] = pd.to_numeric(d["prob"], errors="coerce")
         d["confidence"] = pd.to_numeric(d["confidence"], errors="coerce")
         d = d.dropna(subset=["prob"])
-        d["score"] = d["prob"] * d["confidence"].fillna(0.5)
-        return d[["utcDate", "league", "home", "away", "bet", "prob", "confidence", "score"]]
+
+        scores = []
+        for _, r in d.iterrows():
+            sc, pen, adj = smart_score_v2(
+                prob=float(r["prob"]),
+                confidence=float(r["confidence"]),
+                bet=label,
+                lam_home=float(r["lambda_home"]),
+                lam_away=float(r["lambda_away"]),
+                league_base_total=float(r["league_base_total"]),
+            )
+            scores.append((sc, pen, adj))
+
+        d["score"] = [s[0] for s in scores]
+        d["penalty"] = [s[1] for s in scores]
+        d["adj"] = [s[2] for s in scores]
+
+        return d[["utcDate", "league", "home", "away", "bet", "prob", "confidence", "score", "adj", "penalty"]]
 
     parts = [
         _all_for("p_home", "HOME WIN"),
@@ -475,10 +613,17 @@ def build_top20_mix(probs_df: pd.DataFrame, top_k: int = TOP_MIX) -> pd.DataFram
         _all_for("p_over_2_5", "OVER 2.5"),
         _all_for("p_over_3_5", "OVER 3.5"),
         _all_for("p_under_2_5", "UNDER 2.5"),
+        _all_for("p_1x", "DOUBLE CHANCE 1X"),
+        _all_for("p_x2", "DOUBLE CHANCE X2"),
+        _all_for("p_12", "DOUBLE CHANCE 12"),
         _all_for("p_home_cs", "HOME CLEAN SHEET"),
         _all_for("p_away_cs", "AWAY CLEAN SHEET"),
         _all_for("p_home_win_to_nil", "HOME WIN TO NIL"),
         _all_for("p_away_win_to_nil", "AWAY WIN TO NIL"),
+        _all_for("p_home_dnb_win", "HOME DNB (WIN PROB)"),
+        _all_for("p_away_dnb_win", "AWAY DNB (WIN PROB)"),
+        _all_for("p_btts_yes_over_2_5", "BTTS YES & OVER 2.5"),
+        _all_for("p_btts_no_under_2_5", "BTTS NO & UNDER 2.5"),
     ]
 
     mix = pd.concat(parts, ignore_index=True)
@@ -491,7 +636,7 @@ def build_top20_mix(probs_df: pd.DataFrame, top_k: int = TOP_MIX) -> pd.DataFram
         mix = mix.head(top_k).reset_index(drop=True)
 
     mix.insert(0, "rank", range(1, len(mix) + 1))
-    return mix[["rank", "utcDate", "league", "home", "away", "bet", "prob", "confidence", "score"]]
+    return mix[["rank", "utcDate", "league", "home", "away", "bet", "prob", "confidence", "score", "adj", "penalty"]]
 
 
 # ================= MAIN =================
@@ -588,14 +733,14 @@ def main():
     write_df(TAB_FIXTURES, fx_df)
     write_df(TAB_ACCESS, access_df)
 
-    # Top10 tabs list (always created)
+    # Top10 tabs (no dropdown)
     top10_specs: List[Tuple[str, str, str]] = [
         ("p_home", "HOME WIN", "Top10_Home_Win"),
         ("p_draw", "DRAW", "Top10_Draw"),
         ("p_away", "AWAY WIN", "Top10_Away_Win"),
         ("p_btts_yes", "BTTS YES", "Top10_BTTS_Yes"),
         ("p_btts_no", "BTTS NO", "Top10_BTTS_No"),
-        ("p_over_0_5", "OVER 0.5", "Top10_Over_0_5"),
+        ("p_over_0_5", "OVER 0.5", "Top10_Over_0_5"),  # keep Top10
         ("p_over_1_5", "OVER 1.5", "Top10_Over_1_5"),
         ("p_over_2_5", "OVER 2.5", "Top10_Over_2_5"),
         ("p_over_3_5", "OVER 3.5", "Top10_Over_3_5"),
@@ -630,6 +775,7 @@ def main():
         return
 
     probs_rows: List[Dict[str, Any]] = []
+
     for _, r in fx_df.iterrows():
         league = r.get("league")
         home = r.get("home")
@@ -637,6 +783,7 @@ def main():
 
         base_home_gf = safe_float(league_base.loc[league, "home_gf"], 1.35) if league in league_base.index else 1.35
         base_away_gf = safe_float(league_base.loc[league, "away_gf"], 1.10) if league in league_base.index else 1.10
+        league_base_total = base_home_gf + base_away_gf
 
         def _get(team: str, col: str) -> float:
             try:
@@ -675,13 +822,14 @@ def main():
             "away": away,
             "lambda_home": round(lh, 3),
             "lambda_away": round(la, 3),
+            "league_base_total": round(league_base_total, 3),
             "confidence": round(conf, 3),
             **p,
         })
 
     probs_df = pd.DataFrame(probs_rows)
 
-    # Picks
+    # Picks sheet (still uses raw probs; ranking uses Smart Score)
     def _pick_1x2(row: pd.Series) -> Tuple[str, float]:
         opts = [("HOME", row["p_home"]), ("DRAW", row["p_draw"]), ("AWAY", row["p_away"])]
         best = max(opts, key=lambda x: float(x[1]))
@@ -710,13 +858,14 @@ def main():
 
     write_df(TAB_PICKS, pd.DataFrame(picks).sort_values(["p_1x2", "utcDate"], ascending=[False, True]))
 
-    # Top10 tabs (no dropdown)
+    # Top10 tabs (Smart Score v2 ranking)
     for col, label, tab in top10_specs:
         write_df(tab, top_n_for_market(probs_df, col, label, TOP_N))
 
-    # Top20 mix (Over 0.5 excluded)
+    # Top20 mix (Smart Score v2 ranking; Over 0.5 excluded)
     write_df(TAB_TOP20, build_top20_mix(probs_df, TOP_MIX))
 
+    # Hide everything else
     set_visible_tabs(visible_tabs)
     log("=== DONE ===")
 
