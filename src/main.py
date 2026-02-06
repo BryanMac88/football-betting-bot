@@ -29,7 +29,6 @@ OPTIONAL_COMP_CODES = [
 ]
 
 SLEEP_SECONDS = 7.0
-
 DAYS_AHEAD = 3
 HISTORY_DAYS = 210
 MAX_GOALS = 10
@@ -47,16 +46,25 @@ RECENT_WEIGHT = 1.8
 # Bayesian shrinkage
 SHRINK_K = 8.0
 
-# Head-to-head adjustment (optional)
+# Head-to-head
 USE_H2H = True
 H2H_MATCHES_LOOKBACK = 6
 H2H_SHRINK_K = 4.0
 H2H_MAX_GOAL_ADJ = 0.15
 H2H_BLEND = 0.35
 
-# Confidence scoring
-# Higher = more strict about needing sample size
-CONF_K = 12.0   # "virtual matches" for confidence curve
+# Confidence
+CONF_K = 12.0
+
+# Tabs
+TAB_FIXTURES = "Fixtures"
+TAB_TEAM_FORM = "Team_Form"
+TAB_PICKS = "Picks"
+TAB_TOP10 = "Top10"
+TAB_TOP10_ALL = "Top10_All"
+TAB_TOP10_MARKETS = "Top10_Markets"
+TAB_TOP20 = "Top20_Mix"
+TAB_ACCESS = "Competitions_Access"
 
 
 # ================= UTILS =================
@@ -75,10 +83,6 @@ def env(name: str) -> str:
     return v
 
 
-def poisson(lam: float, k: int) -> float:
-    return math.exp(-lam) * (lam ** k) / math.factorial(k)
-
-
 def safe_float(x: Any, default: float) -> float:
     try:
         v = float(x)
@@ -91,6 +95,10 @@ def safe_float(x: Any, default: float) -> float:
 
 def clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
+
+
+def poisson(lam: float, k: int) -> float:
+    return math.exp(-lam) * (lam ** k) / math.factorial(k)
 
 
 def match_probs(lh: float, la: float) -> Dict[str, float]:
@@ -183,7 +191,6 @@ def match_probs(lh: float, la: float) -> Dict[str, float]:
         "p_over_1_5": p_over_1_5,
         "p_over_2_5": p_over_2_5,
         "p_over_3_5": p_over_3_5,
-        "p_under_0_5": 1.0 - p_over_0_5,
         "p_under_1_5": 1.0 - p_over_1_5,
         "p_under_2_5": 1.0 - p_over_2_5,
         "p_under_3_5": 1.0 - p_over_3_5,
@@ -211,13 +218,16 @@ def open_sheet():
     return gs().open_by_key(env("SHEET_ID"))
 
 
+def _get_or_create_ws(sh: gspread.Spreadsheet, title: str, rows: int = 4000, cols: int = 60) -> gspread.Worksheet:
+    try:
+        return sh.worksheet(title)
+    except gspread.WorksheetNotFound:
+        return sh.add_worksheet(title, rows, cols)
+
+
 def write_df(name: str, df: pd.DataFrame):
     sh = open_sheet()
-    try:
-        ws = sh.worksheet(name)
-    except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(name, 4000, 60)
-
+    ws = _get_or_create_ws(sh, name)
     ws.clear()
     if df is None or df.empty:
         ws.update([["(no data)"]])
@@ -246,6 +256,52 @@ def set_visible_tabs(keep_titles: List[str]):
         sh.batch_update({"requests": reqs})
 
 
+def ensure_top10_dashboard(markets: List[str]) -> None:
+    sh = open_sheet()
+
+    ws_markets = _get_or_create_ws(sh, TAB_TOP10_MARKETS, rows=300, cols=3)
+    _get_or_create_ws(sh, TAB_TOP10_ALL, rows=4000, cols=20)
+    ws_dash = _get_or_create_ws(sh, TAB_TOP10, rows=200, cols=20)
+
+    ws_markets.clear()
+    if markets:
+        ws_markets.update([["market"]] + [[m] for m in markets])
+    else:
+        ws_markets.update([["market"], ["HOME WIN"]])
+
+    default_market = markets[0] if markets else "HOME WIN"
+
+    ws_dash.clear()
+    ws_dash.update("A1", [["Select market:"]])
+    ws_dash.update("B1", [[default_market]])
+
+    headers = ["rank", "utcDate", "league", "home", "away", "bet", "prob", "confidence", "score"]
+    ws_dash.update("A2:I2", [headers])
+
+    formula = '=IFERROR(QUERY(Top10_All!A:I,"select * where F = \'"&$B$1&"\' order by I desc",1),"")'
+    ws_dash.update("A3", [[formula]])
+
+    dash_sid = ws_dash.id
+    reqs = [{
+        "setDataValidation": {
+            "range": {
+                "sheetId": dash_sid,
+                "startRowIndex": 0, "endRowIndex": 1,
+                "startColumnIndex": 1, "endColumnIndex": 2,
+            },
+            "rule": {
+                "condition": {
+                    "type": "ONE_OF_RANGE",
+                    "values": [{"userEnteredValue": "=Top10_Markets!A2:A"}]
+                },
+                "showCustomUi": True,
+                "strict": True
+            }
+        }
+    }]
+    sh.batch_update({"requests": reqs})
+
+
 # ================= FOOTBALL-DATA API =================
 @dataclass
 class FD:
@@ -272,7 +328,7 @@ class FD:
         return self.get("/competitions", {}).get("competitions", [])
 
 
-# ================= FREE MODEL UPGRADES =================
+# ================= MODEL UPGRADES =================
 def recency_weighted_mean(values: List[float], recent_n: int = RECENT_N, recent_weight: float = RECENT_WEIGHT) -> float:
     vals = [float(v) for v in values if v is not None and not (isinstance(v, float) and math.isnan(v))]
     if not vals:
@@ -293,12 +349,11 @@ def shrink(mean_est: float, n: float, prior_mean: float, k: float = SHRINK_K) ->
 
 def compute_league_baselines(rs: pd.DataFrame) -> pd.DataFrame:
     g = rs.groupby("league")
-    out = pd.DataFrame({
+    return pd.DataFrame({
         "home_gf": g["hg"].mean(),
         "away_gf": g["ag"].mean(),
         "n": g.size(),
     })
-    return out
 
 
 def compute_team_indices(rs: pd.DataFrame, league_baselines: pd.DataFrame) -> pd.DataFrame:
@@ -309,39 +364,25 @@ def compute_team_indices(rs: pd.DataFrame, league_baselines: pd.DataFrame) -> pd
         base_home_gf = safe_float(league_baselines.loc[league, "home_gf"], 1.35) if league in league_baselines.index else 1.35
         base_away_gf = safe_float(league_baselines.loc[league, "away_gf"], 1.10) if league in league_baselines.index else 1.10
 
-        # HOME venue per team
         for team, tsub in sub.groupby("home"):
             hg_list = tsub["hg"].tolist()
             ag_list = tsub["ag"].tolist()
             n = len(hg_list)
 
-            home_hg = recency_weighted_mean(hg_list)
-            home_ag = recency_weighted_mean(ag_list)
+            home_hg = shrink(recency_weighted_mean(hg_list), n, base_home_gf)
+            home_ag = shrink(recency_weighted_mean(ag_list), n, base_away_gf)
 
-            home_hg_s = shrink(home_hg, n, base_home_gf)
-            home_ag_s = shrink(home_ag, n, base_away_gf)
+            rows.append({"league": league, "team": team, "home_hg": home_hg, "home_ag": home_ag, "n_home": n})
 
-            rows.append({
-                "league": league, "team": team,
-                "home_hg": home_hg_s, "home_ag": home_ag_s, "n_home": n
-            })
-
-        # AWAY venue per team
         for team, tsub in sub.groupby("away"):
-            ag_list = tsub["ag"].tolist()  # away scored
-            hg_list = tsub["hg"].tolist()  # away conceded
+            ag_list = tsub["ag"].tolist()
+            hg_list = tsub["hg"].tolist()
             n = len(ag_list)
 
-            away_hg = recency_weighted_mean(ag_list)
-            away_ag = recency_weighted_mean(hg_list)
+            away_hg = shrink(recency_weighted_mean(ag_list), n, base_away_gf)
+            away_ag = shrink(recency_weighted_mean(hg_list), n, base_home_gf)
 
-            away_hg_s = shrink(away_hg, n, base_away_gf)
-            away_ag_s = shrink(away_ag, n, base_home_gf)
-
-            rows.append({
-                "league": league, "team": team,
-                "away_hg": away_hg_s, "away_ag": away_ag_s, "n_away": n
-            })
+            rows.append({"league": league, "team": team, "away_hg": away_hg, "away_ag": away_ag, "n_away": n})
 
     df = pd.DataFrame(rows)
     if df.empty:
@@ -366,7 +407,6 @@ def compute_team_indices(rs: pd.DataFrame, league_baselines: pd.DataFrame) -> pd
         away_attack = (row["away_hg"] / base_away_gf) if base_away_gf > 0 else 1.0
         away_def = (row["away_ag"] / base_home_gf) if base_home_gf > 0 else 1.0
 
-        # clamp
         return pd.Series({
             "home_attack": clamp(float(home_attack), 0.55, 1.75),
             "home_defense": clamp(float(home_def), 0.55, 1.75),
@@ -376,7 +416,6 @@ def compute_team_indices(rs: pd.DataFrame, league_baselines: pd.DataFrame) -> pd
 
     idxs = agg.apply(_idx, axis=1)
     out = pd.concat([agg, idxs], axis=1)
-    out["n_total"] = out["n_home"].fillna(0.0) + out["n_away"].fillna(0.0)
     out = out.set_index(["league", "team"])
     return out
 
@@ -395,8 +434,7 @@ def h2h_goal_adjustment(rs: pd.DataFrame, league: str, home: str, away: str) -> 
 
     sub = sub.tail(H2H_MATCHES_LOOKBACK)
 
-    hg = []
-    ag = []
+    hg, ag = [], []
     for _, r in sub.iterrows():
         if r["home"] == home and r["away"] == away:
             hg.append(float(r["hg"]))
@@ -420,16 +458,12 @@ def h2h_goal_adjustment(rs: pd.DataFrame, league: str, home: str, away: str) -> 
     dh *= shrink_factor * H2H_BLEND
     da *= shrink_factor * H2H_BLEND
 
-    dh = clamp(dh, -H2H_MAX_GOAL_ADJ, H2H_MAX_GOAL_ADJ)
-    da = clamp(da, -H2H_MAX_GOAL_ADJ, H2H_MAX_GOAL_ADJ)
-
-    return float(dh), float(da)
+    dh = clamp(float(dh), -H2H_MAX_GOAL_ADJ, H2H_MAX_GOAL_ADJ)
+    da = clamp(float(da), -H2H_MAX_GOAL_ADJ, H2H_MAX_GOAL_ADJ)
+    return dh, da
 
 
 def confidence_score(n_home: float, n_away: float) -> float:
-    """
-    0..1 confidence based on match counts.
-    """
     n = max(0.0, float(n_home or 0.0) + float(n_away or 0.0))
     return float(n / (n + CONF_K))
 
@@ -458,13 +492,7 @@ def _dedupe_teams(df: pd.DataFrame, limit: int) -> pd.DataFrame:
     return pd.DataFrame(kept).reset_index(drop=True)
 
 
-def top_n_for_market(
-    probs_df: pd.DataFrame,
-    prob_col: str,
-    bet_label: str,
-    top_n: int = TOP_N,
-    unique_teams: bool = UNIQUE_TEAMS_PER_TOP10,
-) -> pd.DataFrame:
+def top_n_for_market(probs_df: pd.DataFrame, prob_col: str, bet_label: str, top_n: int = TOP_N) -> pd.DataFrame:
     if probs_df is None or probs_df.empty:
         return pd.DataFrame()
 
@@ -477,12 +505,10 @@ def top_n_for_market(
     df["confidence"] = pd.to_numeric(df["confidence"], errors="coerce")
     df = df.dropna(subset=["prob"])
 
-    # Score: prob weighted by confidence to avoid tiny-sample teams floating to top
     df["score"] = df["prob"] * df["confidence"].fillna(0.5)
-
     df = df.sort_values(["score", "prob", "utcDate"], ascending=[False, False, True]).reset_index(drop=True)
 
-    if unique_teams:
+    if UNIQUE_TEAMS_PER_TOP10:
         df = _dedupe_teams(df, top_n)
     else:
         df = df.head(top_n).reset_index(drop=True)
@@ -491,7 +517,10 @@ def top_n_for_market(
     return df[["rank", "utcDate", "league", "home", "away", "bet", "prob", "confidence", "score"]]
 
 
-def build_top20_mix(probs_df: pd.DataFrame, top_k: int = TOP_MIX, unique_teams: bool = UNIQUE_TEAMS_IN_TOP20) -> pd.DataFrame:
+def build_top20_mix(probs_df: pd.DataFrame, top_k: int = TOP_MIX) -> pd.DataFrame:
+    """
+    NOTE: Over 0.5 is excluded here by design.
+    """
     if probs_df is None or probs_df.empty:
         return pd.DataFrame()
 
@@ -505,36 +534,31 @@ def build_top20_mix(probs_df: pd.DataFrame, top_k: int = TOP_MIX, unique_teams: 
         d["score"] = d["prob"] * d["confidence"].fillna(0.5)
         return d[["utcDate", "league", "home", "away", "bet", "prob", "confidence", "score"]]
 
+    # ✅ Over 0.5 removed from mix
     parts = [
         _all_for("p_home", "HOME WIN"),
         _all_for("p_draw", "DRAW"),
         _all_for("p_away", "AWAY WIN"),
-        _all_for("p_1x", "DOUBLE CHANCE 1X"),
-        _all_for("p_x2", "DOUBLE CHANCE X2"),
-        _all_for("p_12", "DOUBLE CHANCE 12"),
         _all_for("p_btts_yes", "BTTS YES"),
         _all_for("p_btts_no", "BTTS NO"),
-        _all_for("p_over_0_5", "OVER 0.5"),
         _all_for("p_over_1_5", "OVER 1.5"),
         _all_for("p_over_2_5", "OVER 2.5"),
         _all_for("p_over_3_5", "OVER 3.5"),
-        _all_for("p_home_over_0_5", "HOME TEAM OVER 0.5"),
-        _all_for("p_away_over_0_5", "AWAY TEAM OVER 0.5"),
+        _all_for("p_under_2_5", "UNDER 2.5"),
+        _all_for("p_1x", "DOUBLE CHANCE 1X"),
+        _all_for("p_x2", "DOUBLE CHANCE X2"),
+        _all_for("p_12", "DOUBLE CHANCE 12"),
         _all_for("p_home_cs", "HOME CLEAN SHEET"),
         _all_for("p_away_cs", "AWAY CLEAN SHEET"),
         _all_for("p_home_win_to_nil", "HOME WIN TO NIL"),
         _all_for("p_away_win_to_nil", "AWAY WIN TO NIL"),
-        _all_for("p_btts_yes_over_2_5", "BTTS YES & OVER 2.5"),
-        _all_for("p_btts_no_under_2_5", "BTTS NO & UNDER 2.5"),
-        _all_for("p_home_dnb_win", "HOME DNB (WIN PROB)"),
-        _all_for("p_away_dnb_win", "AWAY DNB (WIN PROB)"),
     ]
 
     mix = pd.concat(parts, ignore_index=True)
     mix = mix.drop_duplicates(subset=["utcDate", "home", "away", "bet"])
     mix = mix.sort_values(["score", "prob", "utcDate"], ascending=[False, False, True]).reset_index(drop=True)
 
-    if unique_teams:
+    if UNIQUE_TEAMS_IN_TOP20:
         mix = _dedupe_teams(mix, top_k)
     else:
         mix = mix.head(top_k).reset_index(drop=True)
@@ -571,7 +595,6 @@ def main():
     access_rows: List[Dict[str, Any]] = []
 
     for code in comp_codes:
-        # Fixtures
         time.sleep(SLEEP_SECONDS)
         fx_ok, fx_n, fx_err = True, 0, ""
         try:
@@ -595,7 +618,6 @@ def main():
             fx_err = str(e)
             log(f"skip fixtures {code}: {fx_err}")
 
-        # Results
         time.sleep(SLEEP_SECONDS)
         rs_ok, rs_n, rs_err = True, 0, ""
         try:
@@ -628,56 +650,44 @@ def main():
 
         access_rows.append({
             "code": code,
-            "fixtures_ok": fx_ok,
-            "fixtures_n": fx_n,
-            "fixtures_err": fx_err,
-            "results_ok": rs_ok,
-            "results_n": rs_n,
-            "results_err": rs_err,
+            "fixtures_ok": fx_ok, "fixtures_n": fx_n, "fixtures_err": fx_err,
+            "results_ok": rs_ok, "results_n": rs_n, "results_err": rs_err,
         })
 
     fx_df = pd.DataFrame(fixtures)
     rs_df = pd.DataFrame(results)
     access_df = pd.DataFrame(access_rows)
 
-    write_df("Fixtures", fx_df)
-    write_df("Competitions_Access", access_df)
+    write_df(TAB_FIXTURES, fx_df)
+    write_df(TAB_ACCESS, access_df)
 
-    # Visible tabs you want
-    visible_tabs = [
-        "Fixtures",
-        "Team_Form",
-        "Picks",
-        "Top10",        # dashboard tab you will create with dropdown
-        "Top20_Mix",
-    ]
+    visible_tabs = [TAB_FIXTURES, TAB_TEAM_FORM, TAB_PICKS, TAB_TOP10, TAB_TOP20]
 
     if rs_df.empty:
-        write_df("Team_Form", pd.DataFrame())
-        write_df("Picks", pd.DataFrame())
-        write_df("Top10_All", pd.DataFrame())
-        write_df("Top20_Mix", pd.DataFrame())
+        write_df(TAB_TEAM_FORM, pd.DataFrame())
+        write_df(TAB_PICKS, pd.DataFrame())
+        write_df(TAB_TOP10_ALL, pd.DataFrame())
+        write_df(TAB_TOP10_MARKETS, pd.DataFrame([{"market": "HOME WIN"}]))
+        write_df(TAB_TOP20, pd.DataFrame())
+        ensure_top10_dashboard(["HOME WIN"])
         set_visible_tabs(visible_tabs)
         log("=== DONE (no results) ===")
         return
 
-    # Baselines + indices
     league_base = compute_league_baselines(rs_df)
     team_idx = compute_team_indices(rs_df, league_base)
-
-    # Write Team_Form (includes indices + sample sizes)
-    team_form_df = team_idx.reset_index()
-    write_df("Team_Form", team_form_df)
+    write_df(TAB_TEAM_FORM, team_idx.reset_index())
 
     if fx_df.empty:
-        write_df("Picks", pd.DataFrame())
-        write_df("Top10_All", pd.DataFrame())
-        write_df("Top20_Mix", pd.DataFrame())
+        write_df(TAB_PICKS, pd.DataFrame())
+        write_df(TAB_TOP10_ALL, pd.DataFrame())
+        write_df(TAB_TOP10_MARKETS, pd.DataFrame([{"market": "HOME WIN"}]))
+        write_df(TAB_TOP20, pd.DataFrame())
+        ensure_top10_dashboard(["HOME WIN"])
         set_visible_tabs(visible_tabs)
         log("=== DONE (no fixtures) ===")
         return
 
-    # Build probs
     probs_rows: List[Dict[str, Any]] = []
 
     for _, r in fx_df.iterrows():
@@ -708,18 +718,16 @@ def main():
         n_home = _get_n(home, "n_home")
         n_away = _get_n(away, "n_away")
 
-        # expected goals
         lh = base_home_gf * ha * ad
         la = base_away_gf * aa * hd
 
-        # optional H2H adjustment
         dh, da = h2h_goal_adjustment(rs_df, league, home, away)
         lh = max(0.2, lh + dh)
         la = max(0.2, la + da)
 
         conf = confidence_score(n_home, n_away)
-
         p = match_probs(lh, la)
+
         probs_rows.append({
             "utcDate": r.get("utcDate"),
             "league": league,
@@ -733,7 +741,6 @@ def main():
 
     probs_df = pd.DataFrame(probs_rows)
 
-    # Picks
     def _pick_1x2(row: pd.Series) -> Tuple[str, float]:
         opts = [("HOME", row["p_home"]), ("DRAW", row["p_draw"]), ("AWAY", row["p_away"])]
         best = max(opts, key=lambda x: float(x[1]))
@@ -760,11 +767,10 @@ def main():
             "p_over_2_5": round(float(row["p_over_2_5"]), 3),
         })
 
-    picks_out = pd.DataFrame(picks).sort_values(["p_1x2", "utcDate"], ascending=[False, True])
-    write_df("Picks", picks_out)
+    write_df(TAB_PICKS, pd.DataFrame(picks).sort_values(["p_1x2", "utcDate"], ascending=[False, True]))
 
-    # Build Top10_All master (one table, many markets)
-    markets = [
+    # ✅ Over 0.5 stays here (Top10)
+    markets: List[Tuple[str, str]] = [
         ("p_home", "HOME WIN"),
         ("p_draw", "DRAW"),
         ("p_away", "AWAY WIN"),
@@ -792,20 +798,22 @@ def main():
         ("p_btts_no_under_2_5", "BTTS NO & UNDER 2.5"),
     ]
 
-    top10_all_parts = []
+    top10_parts = []
     for col, label in markets:
-        t = top_n_for_market(probs_df, col, label, TOP_N, unique_teams=UNIQUE_TEAMS_PER_TOP10)
+        t = top_n_for_market(probs_df, col, label, TOP_N)
         if not t.empty:
-            top10_all_parts.append(t)
+            top10_parts.append(t)
 
-    top10_all = pd.concat(top10_all_parts, ignore_index=True) if top10_all_parts else pd.DataFrame()
-    write_df("Top10_All", top10_all)
+    top10_all = pd.concat(top10_parts, ignore_index=True) if top10_parts else pd.DataFrame()
+    write_df(TAB_TOP10_ALL, top10_all)
 
-    # Top20 mix unique per team
-    mix_df = build_top20_mix(probs_df, TOP_MIX, unique_teams=UNIQUE_TEAMS_IN_TOP20)
-    write_df("Top20_Mix", mix_df)
+    market_names = [label for _, label in markets]
+    write_df(TAB_TOP10_MARKETS, pd.DataFrame({"market": market_names}))
+    ensure_top10_dashboard(market_names)
 
-    # Make only your key tabs visible (Top10_All will be used by formulas; keep it hidden)
+    # ✅ Over 0.5 excluded from Top20_Mix inside build_top20_mix()
+    write_df(TAB_TOP20, build_top20_mix(probs_df, TOP_MIX))
+
     set_visible_tabs(visible_tabs)
     log("=== DONE ===")
 
