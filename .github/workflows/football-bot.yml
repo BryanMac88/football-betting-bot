@@ -44,7 +44,7 @@ jobs:
           FOOTBALL_DATA_API_KEY: ${{ secrets.FOOTBALL_DATA_API_KEY }}
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
         run: |
-          python football_bot/run_football_bot.py || \
+          python football_bot/football_bot/run_football_bot.py || \
           python ./football_bot/run_football_bot.py || \
           python ./src/football_bot/run_football_bot.py || \
           (echo "Could not find run_football_bot.py. See Debug output above." && exit 1)
