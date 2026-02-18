@@ -3,7 +3,6 @@ name: Football Bot
 on:
   workflow_dispatch: {}
   schedule:
-    # 09:15 UTC daily (Ireland is UTC in winter, UTC+1 in summer)
     - cron: "15 9 * * *"
 
 jobs:
@@ -13,19 +12,39 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Debug: show repo structure
+        run: |
+          echo "PWD:"
+          pwd
+          echo ""
+          echo "TOP LEVEL:"
+          ls -la
+          echo ""
+          echo "FIND football_bot folder:"
+          find . -maxdepth 4 -type d -name "football_bot" -print
+          echo ""
+          echo "FIND python files matching run_football*.py:"
+          find . -maxdepth 6 -type f -name "run_football*.py" -print
+          echo ""
+          echo "FIND ALL python files under football_bot (if present):"
+          find ./football_bot -maxdepth 6 -type f -name "*.py" -print || true
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install deps (football module only)
+      - name: Install deps (if file exists)
         run: |
           python -m pip install --upgrade pip
-          pip install -r football_bot/requirements_football.txt
+          if [ -f football_bot/requirements_football.txt ]; then pip install -r football_bot/requirements_football.txt; fi
 
-      - name: Run football bot (test)
+      - name: Run (try common locations)
         env:
           FOOTBALL_DATA_API_KEY: ${{ secrets.FOOTBALL_DATA_API_KEY }}
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
         run: |
-          python football_bot/run_football_bot.py
+          python football_bot/run_football_bot.py || \
+          python ./football_bot/run_football_bot.py || \
+          python ./src/football_bot/run_football_bot.py || \
+          (echo "Could not find run_football_bot.py. See Debug output above." && exit 1)
