@@ -1,0 +1,31 @@
+name: Football Bot
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    # 09:15 UTC daily (Ireland is UTC in winter, UTC+1 in summer)
+    - cron: "15 9 * * *"
+
+jobs:
+  run-football-bot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps (football module only)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r football_bot/requirements_football.txt
+
+      - name: Run football bot (test)
+        env:
+          FOOTBALL_DATA_API_KEY: ${{ secrets.FOOTBALL_DATA_API_KEY }}
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+        run: |
+          python football_bot/run_football_bot.py
