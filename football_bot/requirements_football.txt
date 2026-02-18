@@ -3,3 +3,6 @@ numpy
 requests
 scipy
 scikit-learn
+gspread
+google-auth
+python-dateutil
