@@ -1,0 +1,17 @@
+class Config:
+    COMPETITIONS = ("PL",)
+
+    LOOKBACK_DAYS = 540
+    DC_TIME_DECAY_XI = 0.0035
+    L2_SHRINK = 1.0
+
+    W_MARKET_PRIOR = 0.45
+
+    MIN_EV = 0.02
+    MIN_ODDS = 1.6
+    MAX_ODDS = 4.5
+    MAX_BETS_PER_DAY = 5
+
+    BANKROLL_EUR = 1000
+    KELLY_FRACTION = 0.25
+    MAX_STAKE_PCT = 0.02
