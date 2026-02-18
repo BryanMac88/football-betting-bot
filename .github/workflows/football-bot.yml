@@ -28,11 +28,19 @@ jobs:
             echo "No requirements_football.txt found" && exit 1
           fi
 
-      - name: Run football bot
+      - name: Run football data load + model + picks
         env:
+          # Existing repo secrets (from your screenshot)
           FOOTBALL_DATA_TOKEN: ${{ secrets.FOOTBALL_DATA_TOKEN }}
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
+
+          # Repo variables (you created RISK_PROFILE already)
+          RISK_PROFILE: ${{ vars.RISK_PROFILE }}
+
+          # Optional bankroll variable (defaults inside code if not set)
+          BANKROLL_EUR: ${{ vars.BANKROLL_EUR }}
         run: |
           python football_bot/football_bot/run_football_bot.py
+          python football_bot/football_bot/run_football_model.py
