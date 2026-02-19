@@ -29,12 +29,12 @@ def _append_status(sh, msg: str):
     try:
         ws = sh.worksheet(STATUS_TAB)
     except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title=STATUS_TAB, rows=500, cols=10)
+        ws = sh.add_worksheet(title=STATUS_TAB, rows=800, cols=10)
         ws.append_row(["timestamp_utc", "message"])
     ws.append_row([datetime.now(timezone.utc).isoformat(), msg])
 
 
-def _upsert_df(sh, tab: str, df: pd.DataFrame, rows: int = 4000, cols: int = 80):
+def _upsert_df(sh, tab: str, df: pd.DataFrame, rows: int = 4000, cols: int = 100):
     try:
         ws = sh.worksheet(tab)
     except gspread.WorksheetNotFound:
@@ -106,6 +106,51 @@ PROFILES: Dict[str, Profile] = {
     ),
 }
 
+# ---------------- Pick grading thresholds (by profile) ----------------
+# These are expressed in the same "language" as your sheet:
+# score ~ 0.45–0.62 typical; edge/confidence/penalty are 0–1-ish.
+GRADE_THRESHOLDS = {
+    "conservative": {
+        "STRONG":  {"score": 0.55, "edge": 0.10, "conf": 0.68, "pen": 0.06},
+        "MEDIUM":  {"score": 0.52, "edge": 0.08, "conf": 0.64, "pen": 0.08},
+        "WATCH":   {"score": 0.49, "edge": 0.05, "conf": 0.60, "pen": 0.12},
+    },
+    "balanced": {
+        "STRONG":  {"score": 0.52, "edge": 0.08, "conf": 0.63, "pen": 0.07},
+        "MEDIUM":  {"score": 0.49, "edge": 0.05, "conf": 0.60, "pen": 0.09},
+        "WATCH":   {"score": 0.46, "edge": 0.03, "conf": 0.55, "pen": 0.14},
+    },
+    "aggressive": {
+        "STRONG":  {"score": 0.50, "edge": 0.06, "conf": 0.58, "pen": 0.10},
+        "MEDIUM":  {"score": 0.48, "edge": 0.04, "conf": 0.55, "pen": 0.12},
+        "WATCH":   {"score": 0.45, "edge": 0.02, "conf": 0.50, "pen": 0.16},
+    },
+}
+
+
+def grade_pick(risk: str, score: float, edge: float, conf: float, pen: float) -> Tuple[str, str]:
+    """
+    Returns (grade, action)
+    """
+    t = GRADE_THRESHOLDS.get(risk, GRADE_THRESHOLDS["balanced"])
+
+    def ok(level: str) -> bool:
+        req = t[level]
+        return (
+            score >= req["score"]
+            and edge >= req["edge"]
+            and conf >= req["conf"]
+            and pen <= req["pen"]
+        )
+
+    if ok("STRONG"):
+        return "STRONG", "BET"
+    if ok("MEDIUM"):
+        return "MEDIUM", "SMALL"
+    if ok("WATCH"):
+        return "WATCH", "WATCH"
+    return "AVOID", "SKIP"
+
 
 # ---------------- Model helpers ----------------
 def _poisson_pmf(k: int, lam: float) -> float:
@@ -134,8 +179,7 @@ def probs_from_lambdas(lam_home: float, lam_away: float, max_goals: int = 10) ->
     goals = np.add.outer(np.arange(max_goals + 1), np.arange(max_goals + 1))
 
     def p_over(line: float) -> float:
-        # Over 2.5 => total goals >= 3
-        thr = int(line + 0.5) + 1
+        thr = int(line + 0.5) + 1  # Over 2.5 => >=3
         return float(grid[goals >= thr].sum())
 
     out = {
@@ -207,15 +251,14 @@ def fit_team_strength_poisson(df_done: pd.DataFrame, xi: float = 0.0035, l2: flo
     age_days = (now - df["utcDate"]).dt.total_seconds() / 86400.0
     w = np.exp(-xi * age_days.values)
 
-    # params: attack[n], defense[n], home_adv
     x0 = np.zeros(2 * n + 1, dtype=float)
-    x0[-1] = 0.15  # seed
+    x0[-1] = 0.15  # home adv seed
 
     def unpack(x):
         a = x[:n].copy()
         d = x[n : 2 * n].copy()
         ha = float(x[-1])
-        a -= a.mean()  # identifiability
+        a -= a.mean()
         return a, d, ha
 
     def nll(x):
@@ -226,7 +269,6 @@ def fit_team_strength_poisson(df_done: pd.DataFrame, xi: float = 0.0035, l2: flo
             ai = idx[r.away]
             lam_h = np.exp(ha + a[hi] + d[ai])
             lam_a = np.exp(a[ai] + d[hi])
-
             ll += w[i] * (
                 r.home_goals * np.log(lam_h) - lam_h
                 + r.away_goals * np.log(lam_a) - lam_a
@@ -239,7 +281,6 @@ def fit_team_strength_poisson(df_done: pd.DataFrame, xi: float = 0.0035, l2: flo
         raise RuntimeError(f"Poisson fit failed: {res.message}")
 
     a, d, ha = unpack(res.x)
-
     return FitParams(
         teams=teams,
         attack={t: float(a[idx[t]]) for t in teams},
@@ -272,12 +313,44 @@ def kelly_fraction(p: float, odds: float) -> float:
     return float(max(0.0, f))
 
 
+def clamp(x: float, lo: float, hi: float) -> float:
+    return float(max(lo, min(hi, x)))
+
+
+def confidence_from_games(home_games: int, away_games: int) -> float:
+    """
+    Map sample size to 0–1 confidence.
+    0.60-ish around ~9 games, ~0.75 around ~12 games, caps at 1.
+    """
+    m = min(home_games, away_games)
+    return clamp(m / 20.0, 0.0, 1.0)
+
+
+def penalty_from_conf(conf: float) -> float:
+    """
+    Penalty grows when confidence is below 0.70.
+    Returns 0–0.2 range.
+    """
+    gap = max(0.0, 0.70 - conf)
+    return clamp(gap * 0.5, 0.0, 0.20)
+
+
+def score_from_ev(ev: float) -> float:
+    """
+    Convert EV into a 'score' that looks like your sheet (roughly 0.45–0.62).
+    Calibrated so:
+      EV 0.00 -> 0.45
+      EV 0.04 -> 0.59
+      EV 0.06 -> 0.66 (will be rare)
+    """
+    return clamp(0.45 + 3.5 * float(ev), 0.0, 1.0)
+
+
 # ---------------- Main ----------------
 def main():
     risk = os.getenv("RISK_PROFILE", "balanced").strip().lower()
     profile = PROFILES.get(risk, PROFILES["balanced"])
 
-    # Optional suffix so we can write different tabs per profile (e.g. _BALANCED)
     suffix = os.getenv("TAB_SUFFIX", "").strip()
     model_tab = f"{MODEL_TAB_BASE}{suffix}"
     picks_tab = f"{PICKS_TAB_BASE}{suffix}"
@@ -310,7 +383,6 @@ def main():
 
     done = matches.dropna(subset=["home_goals", "away_goals"]).copy()
     upcoming = matches[matches["utcDate"] > pd.Timestamp.now(tz="UTC")].copy()
-
     if done.empty:
         raise RuntimeError("No completed matches available to fit model")
 
@@ -325,6 +397,7 @@ def main():
     )
     team_counts = team_games["team"].value_counts().to_dict()
 
+    # Odds (best effort)
     try:
         odds = _read_tab(sh, ODDS_TAB)
     except Exception:
@@ -346,12 +419,12 @@ def main():
         base_cols += ["status"]
 
     pred_base = upcoming[base_cols].copy()
-
     if not odds.empty and "home" in odds.columns and "away" in odds.columns:
         pred = pred_base.merge(odds, on=["home", "away"], how="left")
     else:
         pred = pred_base.copy()
 
+    # Build model table
     model_rows = []
     for r in pred.itertuples(index=False):
         home = getattr(r, "home")
@@ -373,7 +446,6 @@ def main():
             "away_games_in_fit": ag,
             **probs,
         }
-
         if hasattr(r, "competition"):
             row["competition"] = getattr(r, "competition")
         if hasattr(r, "status"):
@@ -389,47 +461,11 @@ def main():
     if not model_df.empty:
         model_df["utcDate"] = pd.to_datetime(model_df["utcDate"], utc=True, errors="coerce").dt.strftime("%Y-%m-%d %H:%M")
 
-    _upsert_df(sh, model_tab, model_df, rows=4000, cols=80)
+    _upsert_df(sh, model_tab, model_df, rows=4000, cols=100)
     _append_status(sh, f"{model_tab} written. Upcoming games: {len(model_df)}. Risk={risk}")
 
-    # ---------------- Picks ----------------
+    # ---------------- Picks (with grading) ----------------
     picks: List[Dict] = []
-
-    def add_pick(market: str, selection: str, p_model: float, odds_val: float, p_mkt_fair: Optional[float], row: pd.Series):
-        if odds_val is None or pd.isna(odds_val):
-            return
-        odds_val = float(odds_val)
-        if odds_val < profile.min_odds or odds_val > profile.max_odds:
-            return
-        if p_model is None or pd.isna(p_model):
-            return
-
-        p_model = float(p_model)
-        ev = ev_decimal(p_model, odds_val)
-        if ev < profile.min_ev:
-            return
-
-        if p_mkt_fair is not None and not pd.isna(p_mkt_fair):
-            if (p_model - float(p_mkt_fair)) < profile.min_prob_over_market:
-                return
-
-        k = kelly_fraction(p_model, odds_val) * profile.kelly_fraction
-        stake = min(bankroll * k, bankroll * profile.max_stake_pct)
-
-        picks.append({
-            "utcDate": row.get("utcDate", ""),
-            "home": row.get("home", ""),
-            "away": row.get("away", ""),
-            "market": market,
-            "selection": selection,
-            "odds": odds_val,
-            "p_model": p_model,
-            "p_market_fair": (float(p_mkt_fair) if p_mkt_fair is not None and not pd.isna(p_mkt_fair) else ""),
-            "ev": float(ev),
-            "kelly_used": float(k),
-            "stake_eur": float(stake),
-            "risk_profile": risk,
-        })
 
     def fair_1x2(row):
         pH = implied_prob(row.get("odds_1x2_home"))
@@ -442,13 +478,88 @@ def main():
         p2 = implied_prob(o2)
         return normalize_2(p1, p2)
 
+    def add_pick(
+        market: str,
+        selection: str,
+        p_model: float,
+        odds_val: float,
+        p_mkt_fair: Optional[float],
+        row: pd.Series,
+    ):
+        if odds_val is None or pd.isna(odds_val):
+            return
+        odds_val = float(odds_val)
+        if odds_val < profile.min_odds or odds_val > profile.max_odds:
+            return
+        if p_model is None or pd.isna(p_model):
+            return
+        p_model = float(p_model)
+
+        ev = ev_decimal(p_model, odds_val)
+        if ev < profile.min_ev:
+            return
+
+        edge = None
+        if p_mkt_fair is not None and not pd.isna(p_mkt_fair):
+            edge = p_model - float(p_mkt_fair)
+            if edge < profile.min_prob_over_market:
+                return
+        else:
+            edge = ev  # fallback, still useful
+
+        # Kelly stake
+        k = kelly_fraction(p_model, odds_val) * profile.kelly_fraction
+        stake = min(bankroll * k, bankroll * profile.max_stake_pct)
+
+        # Confidence/penalty/score for grading
+        hg = int(row.get("home_games_in_fit", 0))
+        ag = int(row.get("away_games_in_fit", 0))
+        conf = confidence_from_games(hg, ag)
+        pen = penalty_from_conf(conf)
+        score = score_from_ev(ev)
+
+        grade, action = grade_pick(risk, score, float(edge), conf, pen)
+
+        picks.append({
+            # core identifiers
+            "utcDate": row.get("utcDate", ""),
+            "home": row.get("home", ""),
+            "away": row.get("away", ""),
+            "competition": row.get("competition", ""),
+            "market": market,
+            "selection": selection,
+
+            # “sheet style” metrics (what you asked for)
+            "prob": p_model,
+            "edge": float(edge),
+            "home_xg": float(row.get("lambda_home", np.nan)),
+            "away_xg": float(row.get("lambda_away", np.nan)),
+            "confidence": conf,
+            "penalty": pen,
+            "score": score,
+
+            # odds + EV + staking (still useful)
+            "odds": odds_val,
+            "p_market_fair": (float(p_mkt_fair) if p_mkt_fair is not None and not pd.isna(p_mkt_fair) else ""),
+            "ev": float(ev),
+            "kelly_used": float(k),
+            "stake_eur": float(stake),
+
+            # grading
+            "grade": grade,
+            "action": action,
+            "why": f"score={score:.3f} | edge={float(edge):.3f} | conf={conf:.3f} | pen={pen:.3f} | ev={ev:.3f}",
+            "risk_profile": risk,
+        })
+
     if model_df.empty:
-        _upsert_df(sh, picks_tab, pd.DataFrame(), rows=1000, cols=30)
+        _upsert_df(sh, picks_tab, pd.DataFrame(), rows=1000, cols=40)
         _append_status(sh, f"{picks_tab} empty (no upcoming games).")
         print("Model + picks complete (no upcoming games).")
         return
 
     for _, row in model_df.iterrows():
+        # sample size filter (per profile)
         if int(row.get("home_games_in_fit", 0)) < profile.min_games_team or int(row.get("away_games_in_fit", 0)) < profile.min_games_team:
             continue
 
@@ -473,11 +584,11 @@ def main():
 
     picks_df = pd.DataFrame(picks)
     if not picks_df.empty:
-        picks_df = picks_df.sort_values(["ev"], ascending=False).head(profile.max_bets)
+        # rank by score then ev
+        picks_df = picks_df.sort_values(["score", "ev"], ascending=False).head(profile.max_bets)
 
-    _upsert_df(sh, picks_tab, picks_df, rows=1000, cols=30)
+    _upsert_df(sh, picks_tab, picks_df, rows=1000, cols=60)
     _append_status(sh, f"{picks_tab} written. Picks: {len(picks_df)}. Risk={risk}")
-
     print("Model + picks complete.")
 
 
