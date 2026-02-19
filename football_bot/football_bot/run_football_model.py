@@ -20,8 +20,8 @@ SCOPES = [
 MATCHES_TAB = "FOOTBALL_MATCHES"
 ODDS_TAB = "FOOTBALL_ODDS"
 
-MODEL_TAB = "FOOTBALL_MODEL"
-PICKS_TAB = "FOOTBALL_PICKS"
+MODEL_TAB_BASE = "FOOTBALL_MODEL"
+PICKS_TAB_BASE = "FOOTBALL_PICKS"
 STATUS_TAB = "FOOTBALL_STATUS"
 
 
@@ -29,7 +29,7 @@ def _append_status(sh, msg: str):
     try:
         ws = sh.worksheet(STATUS_TAB)
     except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title=STATUS_TAB, rows=400, cols=10)
+        ws = sh.add_worksheet(title=STATUS_TAB, rows=500, cols=10)
         ws.append_row(["timestamp_utc", "message"])
     ws.append_row([datetime.now(timezone.utc).isoformat(), msg])
 
@@ -109,7 +109,7 @@ PROFILES: Dict[str, Profile] = {
 
 # ---------------- Model helpers ----------------
 def _poisson_pmf(k: int, lam: float) -> float:
-    return (lam ** k) * exp(-lam) / factorial(k)
+    return (lam**k) * exp(-lam) / factorial(k)
 
 
 def _goal_probs(lam: float, max_goals: int = 10) -> np.ndarray:
@@ -134,7 +134,7 @@ def probs_from_lambdas(lam_home: float, lam_away: float, max_goals: int = 10) ->
     goals = np.add.outer(np.arange(max_goals + 1), np.arange(max_goals + 1))
 
     def p_over(line: float) -> float:
-        # For x.5 lines: Over 2.5 means total goals >= 3
+        # Over 2.5 => total goals >= 3
         thr = int(line + 0.5) + 1
         return float(grid[goals >= thr].sum())
 
@@ -190,10 +190,6 @@ class FitParams:
 
 
 def fit_team_strength_poisson(df_done: pd.DataFrame, xi: float = 0.0035, l2: float = 1.0) -> FitParams:
-    """
-    df_done columns required:
-      utcDate, home, away, home_goals, away_goals
-    """
     df = df_done.copy()
     df["utcDate"] = pd.to_datetime(df["utcDate"], utc=True, errors="coerce")
     df = df.dropna(subset=["utcDate", "home", "away", "home_goals", "away_goals"])
@@ -211,15 +207,15 @@ def fit_team_strength_poisson(df_done: pd.DataFrame, xi: float = 0.0035, l2: flo
     age_days = (now - df["utcDate"]).dt.total_seconds() / 86400.0
     w = np.exp(-xi * age_days.values)
 
+    # params: attack[n], defense[n], home_adv
     x0 = np.zeros(2 * n + 1, dtype=float)
-    x0[-1] = 0.15  # home adv seed
+    x0[-1] = 0.15  # seed
 
     def unpack(x):
         a = x[:n].copy()
-        d = x[n:2 * n].copy()
+        d = x[n : 2 * n].copy()
         ha = float(x[-1])
-        # identifiability: center attacks
-        a -= a.mean()
+        a -= a.mean()  # identifiability
         return a, d, ha
 
     def nll(x):
@@ -232,8 +228,8 @@ def fit_team_strength_poisson(df_done: pd.DataFrame, xi: float = 0.0035, l2: flo
             lam_a = np.exp(a[ai] + d[hi])
 
             ll += w[i] * (
-                r.home_goals * np.log(lam_h) - lam_h +
-                r.away_goals * np.log(lam_a) - lam_a
+                r.home_goals * np.log(lam_h) - lam_h
+                + r.away_goals * np.log(lam_a) - lam_a
             )
         reg = l2 * (np.sum(a * a) + np.sum(d * d))
         return -(ll - reg)
@@ -281,6 +277,11 @@ def main():
     risk = os.getenv("RISK_PROFILE", "balanced").strip().lower()
     profile = PROFILES.get(risk, PROFILES["balanced"])
 
+    # Optional suffix so we can write different tabs per profile (e.g. _BALANCED)
+    suffix = os.getenv("TAB_SUFFIX", "").strip()
+    model_tab = f"{MODEL_TAB_BASE}{suffix}"
+    picks_tab = f"{PICKS_TAB_BASE}{suffix}"
+
     sheet_id = os.getenv("SHEET_ID")
     sa_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
 
@@ -300,7 +301,6 @@ def main():
     if matches.empty:
         raise RuntimeError(f"{MATCHES_TAB} is empty")
 
-    # types
     for c in ["home_goals", "away_goals"]:
         if c in matches.columns:
             matches[c] = pd.to_numeric(matches[c], errors="coerce")
@@ -308,17 +308,14 @@ def main():
     matches["utcDate"] = pd.to_datetime(matches["utcDate"], utc=True, errors="coerce")
     matches = matches.dropna(subset=["utcDate", "home", "away"])
 
-    # completed and upcoming
     done = matches.dropna(subset=["home_goals", "away_goals"]).copy()
     upcoming = matches[matches["utcDate"] > pd.Timestamp.now(tz="UTC")].copy()
 
     if done.empty:
         raise RuntimeError("No completed matches available to fit model")
 
-    # fit model
     params = fit_team_strength_poisson(done, xi=0.0035, l2=1.0)
 
-    # confidence counts
     team_games = pd.concat(
         [
             done[["home"]].rename(columns={"home": "team"}),
@@ -328,7 +325,6 @@ def main():
     )
     team_counts = team_games["team"].value_counts().to_dict()
 
-    # odds (best effort)
     try:
         odds = _read_tab(sh, ODDS_TAB)
     except Exception:
@@ -356,7 +352,6 @@ def main():
     else:
         pred = pred_base.copy()
 
-    # build model table
     model_rows = []
     for r in pred.itertuples(index=False):
         home = getattr(r, "home")
@@ -394,20 +389,13 @@ def main():
     if not model_df.empty:
         model_df["utcDate"] = pd.to_datetime(model_df["utcDate"], utc=True, errors="coerce").dt.strftime("%Y-%m-%d %H:%M")
 
-    _upsert_df(sh, MODEL_TAB, model_df, rows=4000, cols=80)
-    _append_status(sh, f"FOOTBALL_MODEL written. Upcoming games: {len(model_df)}. Risk={risk}")
+    _upsert_df(sh, model_tab, model_df, rows=4000, cols=80)
+    _append_status(sh, f"{model_tab} written. Upcoming games: {len(model_df)}. Risk={risk}")
 
     # ---------------- Picks ----------------
     picks: List[Dict] = []
 
-    def add_pick(
-        market: str,
-        selection: str,
-        p_model: float,
-        odds_val: float,
-        p_mkt_fair: Optional[float],
-        row: pd.Series,
-    ):
+    def add_pick(market: str, selection: str, p_model: float, odds_val: float, p_mkt_fair: Optional[float], row: pd.Series):
         if odds_val is None or pd.isna(odds_val):
             return
         odds_val = float(odds_val)
@@ -455,8 +443,8 @@ def main():
         return normalize_2(p1, p2)
 
     if model_df.empty:
-        _upsert_df(sh, PICKS_TAB, pd.DataFrame(), rows=1000, cols=30)
-        _append_status(sh, "FOOTBALL_PICKS empty (no upcoming games).")
+        _upsert_df(sh, picks_tab, pd.DataFrame(), rows=1000, cols=30)
+        _append_status(sh, f"{picks_tab} empty (no upcoming games).")
         print("Model + picks complete (no upcoming games).")
         return
 
@@ -487,8 +475,8 @@ def main():
     if not picks_df.empty:
         picks_df = picks_df.sort_values(["ev"], ascending=False).head(profile.max_bets)
 
-    _upsert_df(sh, PICKS_TAB, picks_df, rows=1000, cols=30)
-    _append_status(sh, f"FOOTBALL_PICKS written. Picks: {len(picks_df)}. Risk={risk}")
+    _upsert_df(sh, picks_tab, picks_df, rows=1000, cols=30)
+    _append_status(sh, f"{picks_tab} written. Picks: {len(picks_df)}. Risk={risk}")
 
     print("Model + picks complete.")
 
