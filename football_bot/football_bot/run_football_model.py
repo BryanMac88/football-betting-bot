@@ -34,7 +34,7 @@ def _append_status(sh, msg: str):
     ws.append_row([datetime.now(timezone.utc).isoformat(), msg])
 
 
-def _upsert_df(sh, tab: str, df: pd.DataFrame, rows: int = 4000, cols: int = 60):
+def _upsert_df(sh, tab: str, df: pd.DataFrame, rows: int = 4000, cols: int = 80):
     try:
         ws = sh.worksheet(tab)
     except gspread.WorksheetNotFound:
@@ -75,18 +75,33 @@ class Profile:
 
 PROFILES: Dict[str, Profile] = {
     "conservative": Profile(
-        min_ev=0.04, min_odds=1.70, max_odds=3.50, max_bets=3,
-        kelly_fraction=0.15, max_stake_pct=0.01, min_games_team=8,
+        min_ev=0.04,
+        min_odds=1.70,
+        max_odds=3.50,
+        max_bets=3,
+        kelly_fraction=0.15,
+        max_stake_pct=0.01,
+        min_games_team=8,
         min_prob_over_market=0.03,
     ),
     "balanced": Profile(
-        min_ev=0.025, min_odds=1.60, max_odds=4.50, max_bets=6,
-        kelly_fraction=0.25, max_stake_pct=0.02, min_games_team=5,
+        min_ev=0.025,
+        min_odds=1.60,
+        max_odds=4.50,
+        max_bets=6,
+        kelly_fraction=0.25,
+        max_stake_pct=0.02,
+        min_games_team=5,
         min_prob_over_market=0.02,
     ),
     "aggressive": Profile(
-        min_ev=0.015, min_odds=1.50, max_odds=6.00, max_bets=10,
-        kelly_fraction=0.40, max_stake_pct=0.03, min_games_team=3,
+        min_ev=0.015,
+        min_odds=1.50,
+        max_odds=6.00,
+        max_bets=10,
+        kelly_fraction=0.40,
+        max_stake_pct=0.03,
+        min_games_team=3,
         min_prob_over_market=0.01,
     ),
 }
@@ -103,7 +118,7 @@ def _goal_probs(lam: float, max_goals: int = 10) -> np.ndarray:
     return p / s if s > 0 else p
 
 
-def probs_from_lambdas(lam_home: float, lam_away: float, max_goals: int = 10):
+def probs_from_lambdas(lam_home: float, lam_away: float, max_goals: int = 10) -> Dict[str, float]:
     ph = _goal_probs(lam_home, max_goals)
     pa = _goal_probs(lam_away, max_goals)
     grid = np.outer(ph, pa)
@@ -116,11 +131,11 @@ def probs_from_lambdas(lam_home: float, lam_away: float, max_goals: int = 10):
     p_no = grid[0, :].sum() + grid[:, 0].sum() - grid[0, 0]
     p_yes = 1 - p_no
 
-    # Totals lines
     goals = np.add.outer(np.arange(max_goals + 1), np.arange(max_goals + 1))
+
     def p_over(line: float) -> float:
-        # line is x.5 so over means >= ceil(x.5+0.5) => >= (x+1)
-        thr = int(line + 0.5) + 1  # for 2.5 -> 3
+        # For x.5 lines: Over 2.5 means total goals >= 3
+        thr = int(line + 0.5) + 1
         return float(grid[goals >= thr].sum())
 
     out = {
@@ -132,8 +147,8 @@ def probs_from_lambdas(lam_home: float, lam_away: float, max_goals: int = 10):
     }
     for line in [0.5, 1.5, 2.5, 3.5, 4.5]:
         po = p_over(line)
-        out[f"p_over_{line}"] = po
-        out[f"p_under_{line}"] = 1 - po
+        out[f"p_over_{line}"] = float(po)
+        out[f"p_under_{line}"] = float(1 - po)
     return out
 
 
@@ -165,7 +180,7 @@ def normalize_3(p1, p2, p3):
     return (p1 / s, p2 / s, p3 / s)
 
 
-# ---------------- Team-strength Poisson fit (time-decay + L2 shrink) ----------------
+# ---------------- Team-strength Poisson fit ----------------
 @dataclass
 class FitParams:
     teams: List[str]
@@ -174,13 +189,10 @@ class FitParams:
     home_adv: float
 
 
-def fit_team_strength_poisson(
-    df_done: pd.DataFrame,
-    xi: float = 0.0035,      # time decay
-    l2: float = 1.0          # shrinkage
-) -> FitParams:
+def fit_team_strength_poisson(df_done: pd.DataFrame, xi: float = 0.0035, l2: float = 1.0) -> FitParams:
     """
-    df_done columns: utcDate, home, away, home_goals, away_goals (completed only)
+    df_done columns required:
+      utcDate, home, away, home_goals, away_goals
     """
     df = df_done.copy()
     df["utcDate"] = pd.to_datetime(df["utcDate"], utc=True, errors="coerce")
@@ -199,15 +211,14 @@ def fit_team_strength_poisson(
     age_days = (now - df["utcDate"]).dt.total_seconds() / 86400.0
     w = np.exp(-xi * age_days.values)
 
-    # params: attack[n], defense[n], home_adv
     x0 = np.zeros(2 * n + 1, dtype=float)
-    x0[-1] = 0.15
+    x0[-1] = 0.15  # home adv seed
 
     def unpack(x):
         a = x[:n].copy()
-        d = x[n:2*n].copy()
+        d = x[n:2 * n].copy()
         ha = float(x[-1])
-        # identifiability constraint: sum(attack)=0
+        # identifiability: center attacks
         a -= a.mean()
         return a, d, ha
 
@@ -219,12 +230,12 @@ def fit_team_strength_poisson(
             ai = idx[r.away]
             lam_h = np.exp(ha + a[hi] + d[ai])
             lam_a = np.exp(a[ai] + d[hi])
-            # Poisson log-likelihood
+
             ll += w[i] * (
                 r.home_goals * np.log(lam_h) - lam_h +
                 r.away_goals * np.log(lam_a) - lam_a
             )
-        reg = l2 * (np.sum(a*a) + np.sum(d*d))
+        reg = l2 * (np.sum(a * a) + np.sum(d * d))
         return -(ll - reg)
 
     res = minimize(nll, x0, method="L-BFGS-B")
@@ -272,9 +283,9 @@ def main():
 
     sheet_id = os.getenv("SHEET_ID")
     sa_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
-    bankroll_raw = os.getenv("BANKROLL_EUR", "").strip()
-bankroll = float(bankroll_raw) if bankroll_raw else 1000.0
 
+    bankroll_raw = os.getenv("BANKROLL_EUR", "").strip()
+    bankroll = float(bankroll_raw) if bankroll_raw else 1000.0
 
     if not sheet_id:
         raise RuntimeError("Missing SHEET_ID")
@@ -285,12 +296,11 @@ bankroll = float(bankroll_raw) if bankroll_raw else 1000.0
     gc = gspread.authorize(creds)
     sh = gc.open_by_key(sheet_id)
 
-    # Read matches history
     matches = _read_tab(sh, MATCHES_TAB)
     if matches.empty:
         raise RuntimeError(f"{MATCHES_TAB} is empty")
 
-    # Clean types
+    # types
     for c in ["home_goals", "away_goals"]:
         if c in matches.columns:
             matches[c] = pd.to_numeric(matches[c], errors="coerce")
@@ -300,30 +310,30 @@ bankroll = float(bankroll_raw) if bankroll_raw else 1000.0
 
     # completed and upcoming
     done = matches.dropna(subset=["home_goals", "away_goals"]).copy()
-    upcoming = matches[matches["status"].isin(["SCHEDULED", "TIMED"])].copy()
-    # If status strings differ, also treat future games as upcoming
-    upcoming2 = matches[matches["utcDate"] > pd.Timestamp.now(tz="UTC")].copy()
-    if len(upcoming2) > len(upcoming):
-        upcoming = upcoming2
+    upcoming = matches[matches["utcDate"] > pd.Timestamp.now(tz="UTC")].copy()
 
-    # Fit model
+    if done.empty:
+        raise RuntimeError("No completed matches available to fit model")
+
+    # fit model
     params = fit_team_strength_poisson(done, xi=0.0035, l2=1.0)
 
-    # Team sample counts (confidence filter)
-    team_games = pd.concat([
-        done[["home"]].rename(columns={"home": "team"}),
-        done[["away"]].rename(columns={"away": "team"})
-    ], ignore_index=True)
+    # confidence counts
+    team_games = pd.concat(
+        [
+            done[["home"]].rename(columns={"home": "team"}),
+            done[["away"]].rename(columns={"away": "team"}),
+        ],
+        ignore_index=True,
+    )
     team_counts = team_games["team"].value_counts().to_dict()
 
-    # Read odds if present
-    odds = pd.DataFrame()
+    # odds (best effort)
     try:
         odds = _read_tab(sh, ODDS_TAB)
     except Exception:
         odds = pd.DataFrame()
 
-    # Convert odds cols to numeric if they exist
     odds_cols = [
         "odds_1x2_home", "odds_1x2_draw", "odds_1x2_away",
         "odds_btts_yes", "odds_btts_no",
@@ -333,26 +343,35 @@ bankroll = float(bankroll_raw) if bankroll_raw else 1000.0
         if c in odds.columns:
             odds[c] = pd.to_numeric(odds[c], errors="coerce")
 
-    # Join upcoming with odds on home/away (best effort)
-    pred_base = upcoming[["utcDate", "home", "away", "competition", "status"]].copy() if "competition" in upcoming.columns else upcoming[["utcDate","home","away","status"]].copy()
+    base_cols = ["utcDate", "home", "away"]
+    if "competition" in upcoming.columns:
+        base_cols += ["competition"]
+    if "status" in upcoming.columns:
+        base_cols += ["status"]
+
+    pred_base = upcoming[base_cols].copy()
+
     if not odds.empty and "home" in odds.columns and "away" in odds.columns:
-        pred = pred_base.merge(odds, on=["home", "away"], how="left", suffixes=("", "_odds"))
+        pred = pred_base.merge(odds, on=["home", "away"], how="left")
     else:
         pred = pred_base.copy()
 
-    # Build model rows
+    # build model table
     model_rows = []
     for r in pred.itertuples(index=False):
-        lam_h, lam_a = predict_lambdas(params, getattr(r, "home"), getattr(r, "away"))
+        home = getattr(r, "home")
+        away = getattr(r, "away")
+
+        lam_h, lam_a = predict_lambdas(params, home, away)
         probs = probs_from_lambdas(lam_h, lam_a)
 
-        hg = team_counts.get(getattr(r, "home"), 0)
-        ag = team_counts.get(getattr(r, "away"), 0)
+        hg = int(team_counts.get(home, 0))
+        ag = int(team_counts.get(away, 0))
 
         row = {
             "utcDate": getattr(r, "utcDate"),
-            "home": getattr(r, "home"),
-            "away": getattr(r, "away"),
+            "home": home,
+            "away": away,
             "lambda_home": lam_h,
             "lambda_away": lam_a,
             "home_games_in_fit": hg,
@@ -360,10 +379,15 @@ bankroll = float(bankroll_raw) if bankroll_raw else 1000.0
             **probs,
         }
 
-        # add odds if available
+        if hasattr(r, "competition"):
+            row["competition"] = getattr(r, "competition")
+        if hasattr(r, "status"):
+            row["status"] = getattr(r, "status")
+
         for c in odds_cols:
             if hasattr(r, c):
                 row[c] = getattr(r, c)
+
         model_rows.append(row)
 
     model_df = pd.DataFrame(model_rows)
@@ -373,42 +397,52 @@ bankroll = float(bankroll_raw) if bankroll_raw else 1000.0
     _upsert_df(sh, MODEL_TAB, model_df, rows=4000, cols=80)
     _append_status(sh, f"FOOTBALL_MODEL written. Upcoming games: {len(model_df)}. Risk={risk}")
 
-    # ---------------- Picks (EV + filters) ----------------
-    picks = []
+    # ---------------- Picks ----------------
+    picks: List[Dict] = []
 
-    def add_pick(market: str, side: str, p: float, odds_val: float, p_mkt: Optional[float], row):
-        if odds_val is None or np.isnan(odds_val):
+    def add_pick(
+        market: str,
+        selection: str,
+        p_model: float,
+        odds_val: float,
+        p_mkt_fair: Optional[float],
+        row: pd.Series,
+    ):
+        if odds_val is None or pd.isna(odds_val):
             return
+        odds_val = float(odds_val)
         if odds_val < profile.min_odds or odds_val > profile.max_odds:
             return
-        if p is None or np.isnan(p):
+        if p_model is None or pd.isna(p_model):
             return
-        ev = ev_decimal(p, odds_val)
+
+        p_model = float(p_model)
+        ev = ev_decimal(p_model, odds_val)
         if ev < profile.min_ev:
             return
-        if p_mkt is not None and not np.isnan(p_mkt):
-            if (p - p_mkt) < profile.min_prob_over_market:
+
+        if p_mkt_fair is not None and not pd.isna(p_mkt_fair):
+            if (p_model - float(p_mkt_fair)) < profile.min_prob_over_market:
                 return
 
-        k = kelly_fraction(p, odds_val) * profile.kelly_fraction
+        k = kelly_fraction(p_model, odds_val) * profile.kelly_fraction
         stake = min(bankroll * k, bankroll * profile.max_stake_pct)
 
         picks.append({
-            "utcDate": row["utcDate"],
-            "home": row["home"],
-            "away": row["away"],
+            "utcDate": row.get("utcDate", ""),
+            "home": row.get("home", ""),
+            "away": row.get("away", ""),
             "market": market,
-            "selection": side,
-            "odds": float(odds_val),
-            "p_model": float(p),
-            "p_market_fair": (float(p_mkt) if p_mkt is not None and not np.isnan(p_mkt) else ""),
+            "selection": selection,
+            "odds": odds_val,
+            "p_model": p_model,
+            "p_market_fair": (float(p_mkt_fair) if p_mkt_fair is not None and not pd.isna(p_mkt_fair) else ""),
             "ev": float(ev),
             "kelly_used": float(k),
             "stake_eur": float(stake),
             "risk_profile": risk,
         })
 
-    # Market fair probs from odds (if present)
     def fair_1x2(row):
         pH = implied_prob(row.get("odds_1x2_home"))
         pD = implied_prob(row.get("odds_1x2_draw"))
@@ -420,34 +454,34 @@ bankroll = float(bankroll_raw) if bankroll_raw else 1000.0
         p2 = implied_prob(o2)
         return normalize_2(p1, p2)
 
+    if model_df.empty:
+        _upsert_df(sh, PICKS_TAB, pd.DataFrame(), rows=1000, cols=30)
+        _append_status(sh, "FOOTBALL_PICKS empty (no upcoming games).")
+        print("Model + picks complete (no upcoming games).")
+        return
+
     for _, row in model_df.iterrows():
-        # confidence filter
         if int(row.get("home_games_in_fit", 0)) < profile.min_games_team or int(row.get("away_games_in_fit", 0)) < profile.min_games_team:
             continue
 
-        # 1X2 picks
-        pH, pD, pA = row["p_1x2_home"], row["p_1x2_draw"], row["p_1x2_away"]
-        if "odds_1x2_home" in row and not pd.isna(row["odds_1x2_home"]):
+        # 1X2
+        if not pd.isna(row.get("odds_1x2_home", np.nan)):
             mH, mD, mA = fair_1x2(row)
-            add_pick("1X2", "HOME", pH, row["odds_1x2_home"], mH, row)
-            if "odds_1x2_draw" in row:
-                add_pick("1X2", "DRAW", pD, row["odds_1x2_draw"], mD, row)
-            if "odds_1x2_away" in row:
-                add_pick("1X2", "AWAY", pA, row["odds_1x2_away"], mA, row)
+            add_pick("1X2", "HOME", row["p_1x2_home"], row.get("odds_1x2_home"), mH, row)
+            add_pick("1X2", "DRAW", row["p_1x2_draw"], row.get("odds_1x2_draw"), mD, row)
+            add_pick("1X2", "AWAY", row["p_1x2_away"], row.get("odds_1x2_away"), mA, row)
 
-        # BTTS picks
-        if "odds_btts_yes" in row and not pd.isna(row["odds_btts_yes"]):
+        # BTTS
+        if not pd.isna(row.get("odds_btts_yes", np.nan)):
             mYes, mNo = fair_2way(row.get("odds_btts_yes"), row.get("odds_btts_no"))
-            add_pick("BTTS", "YES", row["p_btts_yes"], row["odds_btts_yes"], mYes, row)
-            if "odds_btts_no" in row and not pd.isna(row["odds_btts_no"]):
-                add_pick("BTTS", "NO", row["p_btts_no"], row["odds_btts_no"], mNo, row)
+            add_pick("BTTS", "YES", row["p_btts_yes"], row.get("odds_btts_yes"), mYes, row)
+            add_pick("BTTS", "NO", row["p_btts_no"], row.get("odds_btts_no"), mNo, row)
 
-        # O/U 2.5 (works if you have those odds)
-        if "odds_ou25_over" in row and not pd.isna(row["odds_ou25_over"]):
+        # O/U 2.5
+        if not pd.isna(row.get("odds_ou25_over", np.nan)):
             mOv, mUn = fair_2way(row.get("odds_ou25_over"), row.get("odds_ou25_under"))
-            add_pick("O/U 2.5", "OVER", row["p_over_2.5"], row["odds_ou25_over"], mOv, row)
-            if "odds_ou25_under" in row and not pd.isna(row["odds_ou25_under"]):
-                add_pick("O/U 2.5", "UNDER", row["p_under_2.5"], row["odds_ou25_under"], mUn, row)
+            add_pick("O/U 2.5", "OVER", row["p_over_2.5"], row.get("odds_ou25_over"), mOv, row)
+            add_pick("O/U 2.5", "UNDER", row["p_under_2.5"], row.get("odds_ou25_under"), mUn, row)
 
     picks_df = pd.DataFrame(picks)
     if not picks_df.empty:
