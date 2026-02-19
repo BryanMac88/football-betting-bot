@@ -272,7 +272,9 @@ def main():
 
     sheet_id = os.getenv("SHEET_ID")
     sa_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
-    bankroll = float(os.getenv("BANKROLL_EUR", "1000"))
+    bankroll_raw = os.getenv("BANKROLL_EUR", "").strip()
+bankroll = float(bankroll_raw) if bankroll_raw else 1000.0
+
 
     if not sheet_id:
         raise RuntimeError("Missing SHEET_ID")
