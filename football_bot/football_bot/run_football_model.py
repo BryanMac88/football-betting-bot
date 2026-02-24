@@ -23,6 +23,7 @@ ODDS_TAB = "FOOTBALL_ODDS"
 
 MODEL_TAB_BASE = "FOOTBALL_MODEL"
 PICKS_TAB_BASE = "FOOTBALL_PICKS"
+TOP_TAB_BASE = "FOOTBALL_TOP_BETS"          # NEW
 DIAG_TAB_BASE = "FOOTBALL_JOIN_DIAG"
 STATUS_TAB = "FOOTBALL_STATUS"
 
@@ -69,7 +70,6 @@ _STOP_WORDS = [
 ]
 
 _ALIAS = {
-    # Add any mappings you notice in your data here
     "manchester united": "man utd",
     "man united": "man utd",
     "manchester city": "man city",
@@ -85,7 +85,7 @@ def norm_team(name: str) -> str:
         return ""
     s = str(name).strip().lower()
     s = s.replace("&", " and ")
-    s = re.sub(r"[^\w\s]", " ", s)            # drop punctuation
+    s = re.sub(r"[^\w\s]", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     parts = [p for p in s.split(" ") if p and p not in _STOP_WORDS]
     s = " ".join(parts)
@@ -143,6 +143,11 @@ def grade_pick(risk: str, score: float, edge: float, conf: float, pen: float) ->
     if ok("WATCH"):
         return "WATCH", "WATCH"
     return "AVOID", "SKIP"
+
+
+def grade_rank(grade: str) -> int:
+    order = {"STRONG": 0, "MEDIUM": 1, "WATCH": 2, "AVOID": 3}
+    return order.get(str(grade).upper().strip(), 9)
 
 
 # ---------------- Model helpers ----------------
@@ -312,6 +317,7 @@ def main():
     suffix = os.getenv("TAB_SUFFIX", "").strip()
     model_tab = f"{MODEL_TAB_BASE}{suffix}"
     picks_tab = f"{PICKS_TAB_BASE}{suffix}"
+    top_tab = f"{TOP_TAB_BASE}{suffix}"
     diag_tab = f"{DIAG_TAB_BASE}{suffix}"
 
     sheet_id = os.getenv("SHEET_ID")
@@ -371,7 +377,7 @@ def main():
         if c in odds.columns:
             odds[c] = pd.to_numeric(odds[c], errors="coerce")
 
-    # Normalize team names in BOTH sets and merge on normalized keys
+    # Normalize and merge odds onto upcoming
     upcoming = upcoming.copy()
     upcoming["home_norm"] = upcoming["home"].map(norm_team)
     upcoming["away_norm"] = upcoming["away"].map(norm_team)
@@ -380,30 +386,21 @@ def main():
         odds = odds.copy()
         odds["home_norm"] = odds["home"].map(norm_team)
         odds["away_norm"] = odds["away"].map(norm_team)
-
-        # Keep latest odds per pairing if duplicates
         odds = odds.drop_duplicates(subset=["home_norm", "away_norm"], keep="last")
-
         pred = upcoming.merge(odds, on=["home_norm", "away_norm"], how="left", suffixes=("", "_odds"))
     else:
         pred = upcoming.copy()
-
-    # Diagnostics: how many upcoming games have any odds?
-    has_any_odds = False
-    if all(c in pred.columns for c in ["odds_1x2_home", "odds_1x2_draw", "odds_1x2_away"]):
-        has_any_odds = pred["odds_1x2_home"].notna().sum() > 0
 
     diag = pd.DataFrame([{
         "risk": risk,
         "upcoming_games": int(len(upcoming)),
         "odds_rows_in_tab": int(len(odds)) if isinstance(odds, pd.DataFrame) else 0,
         "upcoming_with_1x2_odds": int(pred["odds_1x2_home"].notna().sum()) if "odds_1x2_home" in pred.columns else 0,
-        "note": "If upcoming_with_1x2_odds is 0, your odds feed is not matching team names or only covers other leagues.",
     }])
     _upsert_df(sh, diag_tab, diag, rows=50, cols=20)
-    _append_status(sh, f"{diag_tab} written. upcoming={len(upcoming)} with_odds={diag.get('upcoming_with_1x2_odds', [0])[0]}")
+    _append_status(sh, f"{diag_tab} written. upcoming={len(upcoming)} with_odds={int(diag['upcoming_with_1x2_odds'][0])}")
 
-    # Build model table for upcoming (even if odds missing)
+    # Model tab
     model_rows = []
     for r in pred.itertuples(index=False):
         home = getattr(r, "home")
@@ -446,7 +443,7 @@ def main():
     _upsert_df(sh, model_tab, model_df, rows=4000, cols=120)
     _append_status(sh, f"{model_tab} written. Upcoming games: {len(model_df)}. Risk={risk}")
 
-    # ---------------- Picks (require odds to exist) ----------------
+    # Picks
     picks: List[Dict] = []
 
     def fair_1x2(row):
@@ -472,7 +469,6 @@ def main():
         if ev < profile.min_ev:
             return
 
-        edge = None
         if p_mkt_fair is not None and not pd.isna(p_mkt_fair):
             edge = p_model - float(p_mkt_fair)
             if edge < profile.min_prob_over_market:
@@ -517,40 +513,60 @@ def main():
         })
 
     if model_df.empty:
-        _upsert_df(sh, picks_tab, pd.DataFrame(), rows=1000, cols=60)
+        _upsert_df(sh, picks_tab, pd.DataFrame(), rows=1000, cols=80)
+        _upsert_df(sh, top_tab, pd.DataFrame(), rows=200, cols=80)
         _append_status(sh, f"{picks_tab} empty (no upcoming games).")
         return
 
     for _, row in model_df.iterrows():
-        # confidence filter
         if int(row.get("home_games_in_fit", 0)) < profile.min_games_team or int(row.get("away_games_in_fit", 0)) < profile.min_games_team:
             continue
 
-        # 1X2 (only if odds exist)
         if not pd.isna(row.get("odds_1x2_home", np.nan)):
             mH, mD, mA = fair_1x2(row)
             add_pick("1X2", "HOME", row["p_1x2_home"], row.get("odds_1x2_home"), mH, row)
             add_pick("1X2", "DRAW", row["p_1x2_draw"], row.get("odds_1x2_draw"), mD, row)
             add_pick("1X2", "AWAY", row["p_1x2_away"], row.get("odds_1x2_away"), mA, row)
 
-        # BTTS
         if not pd.isna(row.get("odds_btts_yes", np.nan)):
             mYes, mNo = fair_2way(row.get("odds_btts_yes"), row.get("odds_btts_no"))
             add_pick("BTTS", "YES", row["p_btts_yes"], row.get("odds_btts_yes"), mYes, row)
             add_pick("BTTS", "NO", row["p_btts_no"], row.get("odds_btts_no"), mNo, row)
 
-        # O/U 2.5
         if not pd.isna(row.get("odds_ou25_over", np.nan)):
             mOv, mUn = fair_2way(row.get("odds_ou25_over"), row.get("odds_ou25_under"))
             add_pick("O/U 2.5", "OVER", row["p_over_2.5"], row.get("odds_ou25_over"), mOv, row)
             add_pick("O/U 2.5", "UNDER", row["p_under_2.5"], row.get("odds_ou25_under"), mUn, row)
 
     picks_df = pd.DataFrame(picks)
+
+    # --- AUTO SORT (Grade -> Score -> EV) ---
     if not picks_df.empty:
-        picks_df = picks_df.sort_values(["score", "ev"], ascending=False).head(profile.max_bets)
+        picks_df["grade_rank"] = picks_df["grade"].apply(grade_rank)
+        picks_df = (
+            picks_df.sort_values(["grade_rank", "score", "ev"], ascending=[True, False, False])
+            .drop(columns=["grade_rank"])
+            .head(profile.max_bets)
+        )
 
     _upsert_df(sh, picks_tab, picks_df, rows=1000, cols=80)
     _append_status(sh, f"{picks_tab} written. Picks: {len(picks_df)}. Risk={risk}")
+
+    # --- TOP BETS TAB (BET + SMALL only, top 10) ---
+    if picks_df is None or picks_df.empty:
+        top_df = pd.DataFrame()
+    else:
+        top_df = picks_df[picks_df["action"].isin(["BET", "SMALL"])].copy()
+        if not top_df.empty:
+            top_df["grade_rank"] = top_df["grade"].apply(grade_rank)
+            top_df = (
+                top_df.sort_values(["grade_rank", "score", "ev"], ascending=[True, False, False])
+                .drop(columns=["grade_rank"])
+                .head(10)
+            )
+
+    _upsert_df(sh, top_tab, top_df, rows=200, cols=80)
+    _append_status(sh, f"{top_tab} written. Top bets: {len(top_df)}. Risk={risk}")
 
 
 if __name__ == "__main__":
