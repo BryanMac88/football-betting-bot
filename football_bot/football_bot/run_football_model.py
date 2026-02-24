@@ -1,5 +1,6 @@
 import os
 import json
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from math import exp, factorial
@@ -22,6 +23,7 @@ ODDS_TAB = "FOOTBALL_ODDS"
 
 MODEL_TAB_BASE = "FOOTBALL_MODEL"
 PICKS_TAB_BASE = "FOOTBALL_PICKS"
+DIAG_TAB_BASE = "FOOTBALL_JOIN_DIAG"
 STATUS_TAB = "FOOTBALL_STATUS"
 
 
@@ -34,7 +36,7 @@ def _append_status(sh, msg: str):
     ws.append_row([datetime.now(timezone.utc).isoformat(), msg])
 
 
-def _upsert_df(sh, tab: str, df: pd.DataFrame, rows: int = 4000, cols: int = 100):
+def _upsert_df(sh, tab: str, df: pd.DataFrame, rows: int = 4000, cols: int = 120):
     try:
         ws = sh.worksheet(tab)
     except gspread.WorksheetNotFound:
@@ -60,6 +62,36 @@ def _read_tab(sh, tab: str) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=header)
 
 
+# ---------------- Team name normalization ----------------
+_STOP_WORDS = [
+    "fc", "cf", "sc", "afc", "cd", "ac", "sv", "fk", "sk", "nk",
+    "club", "de", "la", "el", "the"
+]
+
+_ALIAS = {
+    # Add any mappings you notice in your data here
+    "manchester united": "man utd",
+    "man united": "man utd",
+    "manchester city": "man city",
+    "tottenham hotspur": "tottenham",
+    "spurs": "tottenham",
+    "wolverhampton wanderers": "wolves",
+    "internazionale": "inter",
+    "borussia mgladbach": "borussia monchengladbach",
+}
+
+def norm_team(name: str) -> str:
+    if name is None:
+        return ""
+    s = str(name).strip().lower()
+    s = s.replace("&", " and ")
+    s = re.sub(r"[^\w\s]", " ", s)            # drop punctuation
+    s = re.sub(r"\s+", " ", s).strip()
+    parts = [p for p in s.split(" ") if p and p not in _STOP_WORDS]
+    s = " ".join(parts)
+    return _ALIAS.get(s, s)
+
+
 # ---------------- Risk profiles ----------------
 @dataclass(frozen=True)
 class Profile:
@@ -70,78 +102,39 @@ class Profile:
     kelly_fraction: float
     max_stake_pct: float
     min_games_team: int
-    min_prob_over_market: float  # require p_model - p_market >= this
+    min_prob_over_market: float
 
 
 PROFILES: Dict[str, Profile] = {
-    "conservative": Profile(
-        min_ev=0.04,
-        min_odds=1.70,
-        max_odds=3.50,
-        max_bets=3,
-        kelly_fraction=0.15,
-        max_stake_pct=0.01,
-        min_games_team=8,
-        min_prob_over_market=0.03,
-    ),
-    "balanced": Profile(
-        min_ev=0.025,
-        min_odds=1.60,
-        max_odds=4.50,
-        max_bets=6,
-        kelly_fraction=0.25,
-        max_stake_pct=0.02,
-        min_games_team=5,
-        min_prob_over_market=0.02,
-    ),
-    "aggressive": Profile(
-        min_ev=0.015,
-        min_odds=1.50,
-        max_odds=6.00,
-        max_bets=10,
-        kelly_fraction=0.40,
-        max_stake_pct=0.03,
-        min_games_team=3,
-        min_prob_over_market=0.01,
-    ),
+    "conservative": Profile(0.04, 1.70, 3.50, 3, 0.15, 0.01, 8, 0.03),
+    "balanced":     Profile(0.025, 1.60, 4.50, 6, 0.25, 0.02, 5, 0.02),
+    "aggressive":   Profile(0.015, 1.50, 6.00, 10, 0.40, 0.03, 3, 0.01),
 }
 
-# ---------------- Pick grading thresholds (by profile) ----------------
-# These are expressed in the same "language" as your sheet:
-# score ~ 0.45–0.62 typical; edge/confidence/penalty are 0–1-ish.
 GRADE_THRESHOLDS = {
     "conservative": {
-        "STRONG":  {"score": 0.55, "edge": 0.10, "conf": 0.68, "pen": 0.06},
-        "MEDIUM":  {"score": 0.52, "edge": 0.08, "conf": 0.64, "pen": 0.08},
-        "WATCH":   {"score": 0.49, "edge": 0.05, "conf": 0.60, "pen": 0.12},
+        "STRONG": {"score": 0.55, "edge": 0.10, "conf": 0.68, "pen": 0.06},
+        "MEDIUM": {"score": 0.52, "edge": 0.08, "conf": 0.64, "pen": 0.08},
+        "WATCH":  {"score": 0.49, "edge": 0.05, "conf": 0.60, "pen": 0.12},
     },
     "balanced": {
-        "STRONG":  {"score": 0.52, "edge": 0.08, "conf": 0.63, "pen": 0.07},
-        "MEDIUM":  {"score": 0.49, "edge": 0.05, "conf": 0.60, "pen": 0.09},
-        "WATCH":   {"score": 0.46, "edge": 0.03, "conf": 0.55, "pen": 0.14},
+        "STRONG": {"score": 0.52, "edge": 0.08, "conf": 0.63, "pen": 0.07},
+        "MEDIUM": {"score": 0.49, "edge": 0.05, "conf": 0.60, "pen": 0.09},
+        "WATCH":  {"score": 0.46, "edge": 0.03, "conf": 0.55, "pen": 0.14},
     },
     "aggressive": {
-        "STRONG":  {"score": 0.50, "edge": 0.06, "conf": 0.58, "pen": 0.10},
-        "MEDIUM":  {"score": 0.48, "edge": 0.04, "conf": 0.55, "pen": 0.12},
-        "WATCH":   {"score": 0.45, "edge": 0.02, "conf": 0.50, "pen": 0.16},
+        "STRONG": {"score": 0.50, "edge": 0.06, "conf": 0.58, "pen": 0.10},
+        "MEDIUM": {"score": 0.48, "edge": 0.04, "conf": 0.55, "pen": 0.12},
+        "WATCH":  {"score": 0.45, "edge": 0.02, "conf": 0.50, "pen": 0.16},
     },
 }
 
-
 def grade_pick(risk: str, score: float, edge: float, conf: float, pen: float) -> Tuple[str, str]:
-    """
-    Returns (grade, action)
-    """
     t = GRADE_THRESHOLDS.get(risk, GRADE_THRESHOLDS["balanced"])
 
     def ok(level: str) -> bool:
         req = t[level]
-        return (
-            score >= req["score"]
-            and edge >= req["edge"]
-            and conf >= req["conf"]
-            and pen <= req["pen"]
-        )
+        return (score >= req["score"] and edge >= req["edge"] and conf >= req["conf"] and pen <= req["pen"])
 
     if ok("STRONG"):
         return "STRONG", "BET"
@@ -156,12 +149,10 @@ def grade_pick(risk: str, score: float, edge: float, conf: float, pen: float) ->
 def _poisson_pmf(k: int, lam: float) -> float:
     return (lam**k) * exp(-lam) / factorial(k)
 
-
 def _goal_probs(lam: float, max_goals: int = 10) -> np.ndarray:
     p = np.array([_poisson_pmf(k, lam) for k in range(max_goals + 1)], dtype=float)
     s = p.sum()
     return p / s if s > 0 else p
-
 
 def probs_from_lambdas(lam_home: float, lam_away: float, max_goals: int = 10) -> Dict[str, float]:
     ph = _goal_probs(lam_home, max_goals)
@@ -172,14 +163,13 @@ def probs_from_lambdas(lam_home: float, lam_away: float, max_goals: int = 10) ->
     p_draw = np.trace(grid)
     p_away = np.triu(grid, 1).sum()
 
-    # BTTS
     p_no = grid[0, :].sum() + grid[:, 0].sum() - grid[0, 0]
     p_yes = 1 - p_no
 
     goals = np.add.outer(np.arange(max_goals + 1), np.arange(max_goals + 1))
 
     def p_over(line: float) -> float:
-        thr = int(line + 0.5) + 1  # Over 2.5 => >=3
+        thr = int(line + 0.5) + 1
         return float(grid[goals >= thr].sum())
 
     out = {
@@ -195,7 +185,6 @@ def probs_from_lambdas(lam_home: float, lam_away: float, max_goals: int = 10) ->
         out[f"p_under_{line}"] = float(1 - po)
     return out
 
-
 def implied_prob(odds: Optional[float]) -> Optional[float]:
     try:
         o = float(odds)
@@ -205,23 +194,17 @@ def implied_prob(odds: Optional[float]) -> Optional[float]:
     except Exception:
         return None
 
-
 def normalize_2(p1, p2):
     if p1 is None or p2 is None:
         return (None, None)
     s = p1 + p2
-    if s <= 0:
-        return (None, None)
-    return (p1 / s, p2 / s)
-
+    return (None, None) if s <= 0 else (p1 / s, p2 / s)
 
 def normalize_3(p1, p2, p3):
     if p1 is None or p2 is None or p3 is None:
         return (None, None, None)
     s = p1 + p2 + p3
-    if s <= 0:
-        return (None, None, None)
-    return (p1 / s, p2 / s, p3 / s)
+    return (None, None, None) if s <= 0 else (p1 / s, p2 / s, p3 / s)
 
 
 # ---------------- Team-strength Poisson fit ----------------
@@ -231,7 +214,6 @@ class FitParams:
     attack: Dict[str, float]
     defense: Dict[str, float]
     home_adv: float
-
 
 def fit_team_strength_poisson(df_done: pd.DataFrame, xi: float = 0.0035, l2: float = 1.0) -> FitParams:
     df = df_done.copy()
@@ -252,11 +234,11 @@ def fit_team_strength_poisson(df_done: pd.DataFrame, xi: float = 0.0035, l2: flo
     w = np.exp(-xi * age_days.values)
 
     x0 = np.zeros(2 * n + 1, dtype=float)
-    x0[-1] = 0.15  # home adv seed
+    x0[-1] = 0.15
 
     def unpack(x):
         a = x[:n].copy()
-        d = x[n : 2 * n].copy()
+        d = x[n:2 * n].copy()
         ha = float(x[-1])
         a -= a.mean()
         return a, d, ha
@@ -269,10 +251,7 @@ def fit_team_strength_poisson(df_done: pd.DataFrame, xi: float = 0.0035, l2: flo
             ai = idx[r.away]
             lam_h = np.exp(ha + a[hi] + d[ai])
             lam_a = np.exp(a[ai] + d[hi])
-            ll += w[i] * (
-                r.home_goals * np.log(lam_h) - lam_h
-                + r.away_goals * np.log(lam_a) - lam_a
-            )
+            ll += w[i] * (r.home_goals * np.log(lam_h) - lam_h + r.away_goals * np.log(lam_a) - lam_a)
         reg = l2 * (np.sum(a * a) + np.sum(d * d))
         return -(ll - reg)
 
@@ -288,7 +267,6 @@ def fit_team_strength_poisson(df_done: pd.DataFrame, xi: float = 0.0035, l2: flo
         home_adv=float(ha),
     )
 
-
 def predict_lambdas(params: FitParams, home: str, away: str) -> Tuple[float, float]:
     a_h = params.attack.get(home, 0.0)
     d_h = params.defense.get(home, 0.0)
@@ -299,12 +277,11 @@ def predict_lambdas(params: FitParams, home: str, away: str) -> Tuple[float, flo
     return lam_home, lam_away
 
 
-# ---------------- Betting math ----------------
+# ---------------- Betting + grading metrics ----------------
 def ev_decimal(p: float, odds: float) -> float:
     b = odds - 1.0
     q = 1.0 - p
     return p * b - q
-
 
 def kelly_fraction(p: float, odds: float) -> float:
     b = odds - 1.0
@@ -312,37 +289,18 @@ def kelly_fraction(p: float, odds: float) -> float:
     f = (b * p - q) / b
     return float(max(0.0, f))
 
-
 def clamp(x: float, lo: float, hi: float) -> float:
     return float(max(lo, min(hi, x)))
 
-
 def confidence_from_games(home_games: int, away_games: int) -> float:
-    """
-    Map sample size to 0–1 confidence.
-    0.60-ish around ~9 games, ~0.75 around ~12 games, caps at 1.
-    """
     m = min(home_games, away_games)
     return clamp(m / 20.0, 0.0, 1.0)
 
-
 def penalty_from_conf(conf: float) -> float:
-    """
-    Penalty grows when confidence is below 0.70.
-    Returns 0–0.2 range.
-    """
     gap = max(0.0, 0.70 - conf)
     return clamp(gap * 0.5, 0.0, 0.20)
 
-
 def score_from_ev(ev: float) -> float:
-    """
-    Convert EV into a 'score' that looks like your sheet (roughly 0.45–0.62).
-    Calibrated so:
-      EV 0.00 -> 0.45
-      EV 0.04 -> 0.59
-      EV 0.06 -> 0.66 (will be rare)
-    """
     return clamp(0.45 + 3.5 * float(ev), 0.0, 1.0)
 
 
@@ -354,6 +312,7 @@ def main():
     suffix = os.getenv("TAB_SUFFIX", "").strip()
     model_tab = f"{MODEL_TAB_BASE}{suffix}"
     picks_tab = f"{PICKS_TAB_BASE}{suffix}"
+    diag_tab = f"{DIAG_TAB_BASE}{suffix}"
 
     sheet_id = os.getenv("SHEET_ID")
     sa_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
@@ -397,7 +356,7 @@ def main():
     )
     team_counts = team_games["team"].value_counts().to_dict()
 
-    # Odds (best effort)
+    # Odds
     try:
         odds = _read_tab(sh, ODDS_TAB)
     except Exception:
@@ -412,19 +371,39 @@ def main():
         if c in odds.columns:
             odds[c] = pd.to_numeric(odds[c], errors="coerce")
 
-    base_cols = ["utcDate", "home", "away"]
-    if "competition" in upcoming.columns:
-        base_cols += ["competition"]
-    if "status" in upcoming.columns:
-        base_cols += ["status"]
+    # Normalize team names in BOTH sets and merge on normalized keys
+    upcoming = upcoming.copy()
+    upcoming["home_norm"] = upcoming["home"].map(norm_team)
+    upcoming["away_norm"] = upcoming["away"].map(norm_team)
 
-    pred_base = upcoming[base_cols].copy()
     if not odds.empty and "home" in odds.columns and "away" in odds.columns:
-        pred = pred_base.merge(odds, on=["home", "away"], how="left")
-    else:
-        pred = pred_base.copy()
+        odds = odds.copy()
+        odds["home_norm"] = odds["home"].map(norm_team)
+        odds["away_norm"] = odds["away"].map(norm_team)
 
-    # Build model table
+        # Keep latest odds per pairing if duplicates
+        odds = odds.drop_duplicates(subset=["home_norm", "away_norm"], keep="last")
+
+        pred = upcoming.merge(odds, on=["home_norm", "away_norm"], how="left", suffixes=("", "_odds"))
+    else:
+        pred = upcoming.copy()
+
+    # Diagnostics: how many upcoming games have any odds?
+    has_any_odds = False
+    if all(c in pred.columns for c in ["odds_1x2_home", "odds_1x2_draw", "odds_1x2_away"]):
+        has_any_odds = pred["odds_1x2_home"].notna().sum() > 0
+
+    diag = pd.DataFrame([{
+        "risk": risk,
+        "upcoming_games": int(len(upcoming)),
+        "odds_rows_in_tab": int(len(odds)) if isinstance(odds, pd.DataFrame) else 0,
+        "upcoming_with_1x2_odds": int(pred["odds_1x2_home"].notna().sum()) if "odds_1x2_home" in pred.columns else 0,
+        "note": "If upcoming_with_1x2_odds is 0, your odds feed is not matching team names or only covers other leagues.",
+    }])
+    _upsert_df(sh, diag_tab, diag, rows=50, cols=20)
+    _append_status(sh, f"{diag_tab} written. upcoming={len(upcoming)} with_odds={diag.get('upcoming_with_1x2_odds', [0])[0]}")
+
+    # Build model table for upcoming (even if odds missing)
     model_rows = []
     for r in pred.itertuples(index=False):
         home = getattr(r, "home")
@@ -440,12 +419,15 @@ def main():
             "utcDate": getattr(r, "utcDate"),
             "home": home,
             "away": away,
+            "home_norm": getattr(r, "home_norm"),
+            "away_norm": getattr(r, "away_norm"),
             "lambda_home": lam_h,
             "lambda_away": lam_a,
             "home_games_in_fit": hg,
             "away_games_in_fit": ag,
             **probs,
         }
+
         if hasattr(r, "competition"):
             row["competition"] = getattr(r, "competition")
         if hasattr(r, "status"):
@@ -461,10 +443,10 @@ def main():
     if not model_df.empty:
         model_df["utcDate"] = pd.to_datetime(model_df["utcDate"], utc=True, errors="coerce").dt.strftime("%Y-%m-%d %H:%M")
 
-    _upsert_df(sh, model_tab, model_df, rows=4000, cols=100)
+    _upsert_df(sh, model_tab, model_df, rows=4000, cols=120)
     _append_status(sh, f"{model_tab} written. Upcoming games: {len(model_df)}. Risk={risk}")
 
-    # ---------------- Picks (with grading) ----------------
+    # ---------------- Picks (require odds to exist) ----------------
     picks: List[Dict] = []
 
     def fair_1x2(row):
@@ -478,23 +460,14 @@ def main():
         p2 = implied_prob(o2)
         return normalize_2(p1, p2)
 
-    def add_pick(
-        market: str,
-        selection: str,
-        p_model: float,
-        odds_val: float,
-        p_mkt_fair: Optional[float],
-        row: pd.Series,
-    ):
+    def add_pick(market: str, selection: str, p_model: float, odds_val: float, p_mkt_fair: Optional[float], row: pd.Series):
         if odds_val is None or pd.isna(odds_val):
             return
         odds_val = float(odds_val)
         if odds_val < profile.min_odds or odds_val > profile.max_odds:
             return
-        if p_model is None or pd.isna(p_model):
-            return
-        p_model = float(p_model)
 
+        p_model = float(p_model)
         ev = ev_decimal(p_model, odds_val)
         if ev < profile.min_ev:
             return
@@ -505,13 +478,11 @@ def main():
             if edge < profile.min_prob_over_market:
                 return
         else:
-            edge = ev  # fallback, still useful
+            edge = ev
 
-        # Kelly stake
         k = kelly_fraction(p_model, odds_val) * profile.kelly_fraction
         stake = min(bankroll * k, bankroll * profile.max_stake_pct)
 
-        # Confidence/penalty/score for grading
         hg = int(row.get("home_games_in_fit", 0))
         ag = int(row.get("away_games_in_fit", 0))
         conf = confidence_from_games(hg, ag)
@@ -521,15 +492,12 @@ def main():
         grade, action = grade_pick(risk, score, float(edge), conf, pen)
 
         picks.append({
-            # core identifiers
             "utcDate": row.get("utcDate", ""),
             "home": row.get("home", ""),
             "away": row.get("away", ""),
             "competition": row.get("competition", ""),
             "market": market,
             "selection": selection,
-
-            # “sheet style” metrics (what you asked for)
             "prob": p_model,
             "edge": float(edge),
             "home_xg": float(row.get("lambda_home", np.nan)),
@@ -537,15 +505,11 @@ def main():
             "confidence": conf,
             "penalty": pen,
             "score": score,
-
-            # odds + EV + staking (still useful)
             "odds": odds_val,
             "p_market_fair": (float(p_mkt_fair) if p_mkt_fair is not None and not pd.isna(p_mkt_fair) else ""),
             "ev": float(ev),
             "kelly_used": float(k),
             "stake_eur": float(stake),
-
-            # grading
             "grade": grade,
             "action": action,
             "why": f"score={score:.3f} | edge={float(edge):.3f} | conf={conf:.3f} | pen={pen:.3f} | ev={ev:.3f}",
@@ -553,17 +517,16 @@ def main():
         })
 
     if model_df.empty:
-        _upsert_df(sh, picks_tab, pd.DataFrame(), rows=1000, cols=40)
+        _upsert_df(sh, picks_tab, pd.DataFrame(), rows=1000, cols=60)
         _append_status(sh, f"{picks_tab} empty (no upcoming games).")
-        print("Model + picks complete (no upcoming games).")
         return
 
     for _, row in model_df.iterrows():
-        # sample size filter (per profile)
+        # confidence filter
         if int(row.get("home_games_in_fit", 0)) < profile.min_games_team or int(row.get("away_games_in_fit", 0)) < profile.min_games_team:
             continue
 
-        # 1X2
+        # 1X2 (only if odds exist)
         if not pd.isna(row.get("odds_1x2_home", np.nan)):
             mH, mD, mA = fair_1x2(row)
             add_pick("1X2", "HOME", row["p_1x2_home"], row.get("odds_1x2_home"), mH, row)
@@ -584,12 +547,10 @@ def main():
 
     picks_df = pd.DataFrame(picks)
     if not picks_df.empty:
-        # rank by score then ev
         picks_df = picks_df.sort_values(["score", "ev"], ascending=False).head(profile.max_bets)
 
-    _upsert_df(sh, picks_tab, picks_df, rows=1000, cols=60)
+    _upsert_df(sh, picks_tab, picks_df, rows=1000, cols=80)
     _append_status(sh, f"{picks_tab} written. Picks: {len(picks_df)}. Risk={risk}")
-    print("Model + picks complete.")
 
 
 if __name__ == "__main__":
