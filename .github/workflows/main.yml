@@ -5,6 +5,10 @@ on:
   schedule:
     - cron: "0 10 * * *"   # 10:00 UTC daily
 
+concurrency:
+  group: football-betting-bot
+  cancel-in-progress: true
+
 jobs:
   run:
     runs-on: ubuntu-latest
@@ -14,8 +18,14 @@ jobs:
       SHEET_ID: ${{ secrets.SHEET_ID }}
       GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
 
-      BANKROLL: "100"
-      KELLY_FRACTION: "0.25"
+      # Bot settings (prefer repo Variables, fallback defaults here)
+      RISK_PROFILE: ${{ vars.RISK_PROFILE }}
+      BANKROLL_EUR: ${{ vars.BANKROLL_EUR }}
+      TAB_SUFFIX: ${{ vars.TAB_SUFFIX }}
+      CLEANUP_MODE: ${{ vars.CLEANUP_MODE }}
+      PROTECT_TABS: ${{ vars.PROTECT_TABS }}
+      STRICT_SCHEMA: ${{ vars.STRICT_SCHEMA }}
+      MAX_BEST_PER_GAME: ${{ vars.MAX_BEST_PER_GAME }}
 
       PYTHONUNBUFFERED: "1"
 
@@ -33,6 +43,6 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run bot
+      - name: Run model
         run: |
           python football_bot/football_bot/run_football_model.py
