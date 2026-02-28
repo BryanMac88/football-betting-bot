@@ -35,4 +35,4 @@ jobs:
 
       - name: Run bot
         run: |
-          python -m src.main
+          python football_bot/football_bot/run_football_model.py
