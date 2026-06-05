@@ -3,7 +3,7 @@ name: Football Betting Bot
 on:
   workflow_dispatch: {}
   schedule:
-    - cron: "0 10 * * *"   # Runs daily at 10:00 UTC
+    - cron: "0 10 * * *"   # Daily at 10:00 UTC
 
 jobs:
   run-bot:
