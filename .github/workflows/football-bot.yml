@@ -1,15 +1,15 @@
-name: Football Bot
+name: Football Betting Bot
 
 on:
   workflow_dispatch: {}
   schedule:
-    - cron: "15 9 * * *"
+    - cron: "15 9 * * *"   # ~10:15 UTC daily
 
 jobs:
-  run-football-bot:
+  run-bot:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
+      - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Setup Python
@@ -17,27 +17,20 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install deps (football)
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          if [ -f football_bot/football_bot/requirements_football.txt ]; then
-            pip install -r football_bot/football_bot/requirements_football.txt
-          elif [ -f football_bot/requirements_football.txt ]; then
-            pip install -r football_bot/requirements_football.txt
-          else
-            echo "No requirements_football.txt found" && exit 1
-          fi
+          pip install -r requirements.txt
 
-      - name: Run football data load + model + picks (all profiles)
+      - name: Run the bot
         env:
-          FOOTBALL_DATA_TOKEN: ${{ secrets.FOOTBALL_DATA_TOKEN }}
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
-          BANKROLL_EUR: ${{ vars.BANKROLL_EUR }}
+          # Optional
+          BANKROLL: ${{ vars.BANKROLL || 100 }}
+          KELLY_FRACTION: ${{ vars.KELLY_FRACTION || 0.25 }}
+          MIN_EDGE: ${{ vars.MIN_EDGE || 0.03 }}
+          REGION: ${{ vars.REGION || 'uk' }}
         run: |
-          python football_bot/football_bot/run_football_bot.py
-
-          RISK_PROFILE=conservative TAB_SUFFIX=_CONSERVATIVE python football_bot/football_bot/run_football_model.py
-          RISK_PROFILE=balanced     TAB_SUFFIX=_BALANCED     python football_bot/football_bot/run_football_model.py
-          RISK_PROFILE=aggressive   TAB_SUFFIX=_AGGRESSIVE   python football_bot/football_bot/run_football_model.py
+          python -m src.main_bot/run_football_model.py
