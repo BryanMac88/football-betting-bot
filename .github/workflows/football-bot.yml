@@ -24,9 +24,10 @@ jobs:
           pip install -r requirements.txt
 
       - name: Run the bot
-        env:
-          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
-          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-          SHEET_ID: ${{ secrets.SHEET_ID }}
-        run: |
-          python -m src.main
+  env:
+    ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+    FOOTBALL_DATA_TOKEN: ${{ secrets.FOOTBALL_DATA_TOKEN }}
+    GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+    SHEET_ID: ${{ secrets.SHEET_ID }}
+  run: |
+    python -m src.main
