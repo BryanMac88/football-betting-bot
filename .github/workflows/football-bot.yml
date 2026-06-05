@@ -3,11 +3,12 @@ name: Football Betting Bot
 on:
   workflow_dispatch: {}
   schedule:
-    - cron: "15 9 * * *"   # ~10:15 UTC daily
+    - cron: "0 10 * * *"   # Runs daily at 10:00 UTC
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -27,10 +28,5 @@ jobs:
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
-          # Optional
-          BANKROLL: ${{ vars.BANKROLL || 100 }}
-          KELLY_FRACTION: ${{ vars.KELLY_FRACTION || 0.25 }}
-          MIN_EDGE: ${{ vars.MIN_EDGE || 0.03 }}
-          REGION: ${{ vars.REGION || 'uk' }}
         run: |
-          python -m src.main_bot/run_football_model.py
+          python -m src.main
