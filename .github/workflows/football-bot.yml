@@ -23,11 +23,20 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run the bot
+      - name: Run the bot (debug env)
   env:
     ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
     FOOTBALL_DATA_TOKEN: ${{ secrets.FOOTBALL_DATA_TOKEN }}
     GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
     SHEET_ID: ${{ secrets.SHEET_ID }}
   run: |
+    echo "=== ENV CHECK START ==="
+
+    if [ -z "$FOOTBALL_DATA_TOKEN" ]; then
+      echo "❌ FOOTBALL_DATA_TOKEN is NOT being passed into the runner"
+      exit 1
+    fi
+
+    echo "✔ FOOTBALL_DATA_TOKEN is present"
+
     python -m src.main
