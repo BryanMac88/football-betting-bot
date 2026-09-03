@@ -14,9 +14,9 @@ import gspread
 from google.oauth2.service_account import Credentials
 
 from odds_api import (
-    OddsAPI,
+    OddsApi,
     FD_TO_ODDS_SPORT,
-    best_prices,
+    best_h2h_prices,
     devig_three_way,
     match_fixture,
 )
@@ -456,7 +456,7 @@ def confidence_score(n_home: float, n_away: float) -> float:
 def fetch_market_odds(fx_df: pd.DataFrame) -> Dict[Tuple[str, str, str], Dict[str, Any]]:
     """Fetch Odds API events per league and fuzzy-match each fixture to one.
     Returns {(league, home, away): {'h2h': {...}, 'event': {...}}}."""
-    api = OddsAPI(env("ODDS_API_KEY"))
+    api = OddsApi(env("ODDS_API_KEY"))
     events_by_sport: Dict[str, List[Dict[str, Any]]] = {}
     matched: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
 
@@ -466,7 +466,7 @@ def fetch_market_odds(fx_df: pd.DataFrame) -> Dict[Tuple[str, str, str], Dict[st
             continue
         if sport_key not in events_by_sport:
             try:
-                events_by_sport[sport_key] = api.get_odds(sport_key)
+                events_by_sport[sport_key] = api.get_odds(sport_key, markets=["h2h"])
             except Exception as e:
                 log(f"odds fetch failed for {sport_key}: {e}")
                 events_by_sport[sport_key] = []
@@ -476,7 +476,7 @@ def fetch_market_odds(fx_df: pd.DataFrame) -> Dict[Tuple[str, str, str], Dict[st
             if ev is None:
                 continue
             matched[(league, r["home"], r["away"])] = {
-                "h2h": best_prices(ev, "h2h"),
+                "h2h": best_h2h_prices(ev),
                 "event": ev,
             }
 
