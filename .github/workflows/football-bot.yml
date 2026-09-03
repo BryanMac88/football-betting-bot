@@ -39,4 +39,4 @@ jobs:
 
           echo "FOOTBALL_DATA_TOKEN is present"
 
-          python -m src.main
+          python src/main.py
