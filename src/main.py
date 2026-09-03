@@ -271,6 +271,19 @@ def write_df(name: str, df: pd.DataFrame):
         ws.update([list(df.columns)] + df.fillna("").values.tolist())
 
 
+def sort_by_date(df: pd.DataFrame, date_col: str = "utcDate") -> pd.DataFrame:
+    """Sort a tab's rows chronologically before writing to Sheets.
+    Leaves rank/score columns untouched — only row order changes.
+    Rows with missing/unparseable dates sink to the bottom rather
+    than being dropped."""
+    if df is None or df.empty or date_col not in df.columns:
+        return df
+    out = df.copy()
+    out["_sort_dt"] = pd.to_datetime(out[date_col], errors="coerce", utc=True)
+    out = out.sort_values("_sort_dt", ascending=True, na_position="last").drop(columns=["_sort_dt"])
+    return out.reset_index(drop=True)
+
+
 def set_visible_tabs(keep_titles: List[str]):
     sh = open_sheet()
     meta = sh.fetch_sheet_metadata()
@@ -891,7 +904,7 @@ def main():
     rs_df = pd.DataFrame(results)
     access_df = pd.DataFrame(access_rows)
 
-    write_df(TAB_FIXTURES, fx_df)
+    write_df(TAB_FIXTURES, sort_by_date(fx_df))
     write_df(TAB_ACCESS, access_df)
 
     top10_specs: List[Tuple[str, str, str]] = [
@@ -1037,25 +1050,25 @@ def main():
             "p_over_1_5": round(float(row["p_over_1_5"]), 3),
             "p_over_2_5": round(float(row["p_over_2_5"]), 3),
         })
-    write_df(TAB_PICKS, pd.DataFrame(picks).sort_values(["p_1x2", "utcDate"], ascending=[False, True]))
+    write_df(TAB_PICKS, sort_by_date(pd.DataFrame(picks)))
 
     # Top10 tabs
     for col, label, tab in top10_specs:
-        write_df(tab, top_n_for_market(probs_df, col, label, TOP_N))
+        write_df(tab, sort_by_date(top_n_for_market(probs_df, col, label, TOP_N)))
 
     # Top20 mix
-    write_df(TAB_TOP20, build_top20_mix(probs_df, TOP_MIX))
+    write_df(TAB_TOP20, sort_by_date(build_top20_mix(probs_df, TOP_MIX)))
 
     # Baselines + Safe/Balanced tabs
     baselines = build_league_market_baselines(probs_df)
     safe_df = make_filtered_picks(probs_df, baselines, SAFE_RULES, max_rows=20, unique_teams=True)
     bal_df = make_filtered_picks(probs_df, baselines, BAL_RULES, max_rows=30, unique_teams=True)
 
-    write_df(TAB_SAFE, safe_df)
-    write_df(TAB_BAL, bal_df)
+    write_df(TAB_SAFE, sort_by_date(safe_df))
+    write_df(TAB_BAL, sort_by_date(bal_df))
 
     # Best Bets tab: highest win probability across all games, blended with market odds
-    write_df(TAB_BEST_BETS, build_best_bets(probs_df))
+    write_df(TAB_BEST_BETS, sort_by_date(build_best_bets(probs_df)))
 
     set_visible_tabs(visible_tabs)
     log("=== DONE ===")
