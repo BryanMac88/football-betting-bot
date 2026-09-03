@@ -6,12 +6,20 @@ import os
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 import requests
 import gspread
 from google.oauth2.service_account import Credentials
+
+from odds_api import (
+    OddsAPI,
+    FD_TO_ODDS_SPORT,
+    best_prices,
+    devig_three_way,
+    match_fixture,
+)
 
 
 # ================= CONFIG =================
@@ -56,6 +64,9 @@ H2H_BLEND = 0.35
 # Confidence
 CONF_K = 12.0
 
+# Market odds blend (model probability vs. de-vigged bookmaker probability)
+MARKET_BLEND_ALPHA = 0.5  # weight on model; (1 - alpha) weight on market. Tune via backtest.
+
 # Tabs
 TAB_FIXTURES = "Fixtures"
 TAB_TEAM_FORM = "Team_Form"
@@ -64,6 +75,7 @@ TAB_TOP20 = "Top20_Mix"
 TAB_ACCESS = "Competitions_Access"
 TAB_SAFE = "Safe_Picks"
 TAB_BAL = "Balanced_Picks"
+TAB_BEST_BETS = "Best_Bets"
 
 
 # ================= UTILS =================
@@ -440,6 +452,54 @@ def confidence_score(n_home: float, n_away: float) -> float:
     return float(n / (n + CONF_K))
 
 
+# ================= MARKET ODDS INTEGRATION =================
+def fetch_market_odds(fx_df: pd.DataFrame) -> Dict[Tuple[str, str, str], Dict[str, Any]]:
+    """Fetch Odds API events per league and fuzzy-match each fixture to one.
+    Returns {(league, home, away): {'h2h': {...}, 'event': {...}}}."""
+    api = OddsAPI(env("ODDS_API_KEY"))
+    events_by_sport: Dict[str, List[Dict[str, Any]]] = {}
+    matched: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+
+    for league, sub in fx_df.groupby("league"):
+        sport_key = FD_TO_ODDS_SPORT.get(league)
+        if not sport_key:
+            continue
+        if sport_key not in events_by_sport:
+            try:
+                events_by_sport[sport_key] = api.get_odds(sport_key)
+            except Exception as e:
+                log(f"odds fetch failed for {sport_key}: {e}")
+                events_by_sport[sport_key] = []
+
+        for _, r in sub.iterrows():
+            ev = match_fixture(r["home"], r["away"], r["utcDate"], events_by_sport[sport_key])
+            if ev is None:
+                continue
+            matched[(league, r["home"], r["away"])] = {
+                "h2h": best_prices(ev, "h2h"),
+                "event": ev,
+            }
+
+    return matched
+
+
+def market_probs_for_fixture(odds_entry: Optional[Dict[str, Any]], home: str, away: str) -> Dict[str, float]:
+    out: Dict[str, float] = {}
+    if not odds_entry:
+        return out
+    h2h = odds_entry.get("h2h", {})
+    if home in h2h and away in h2h and "Draw" in h2h:
+        ph, pdw, pa = devig_three_way(h2h[home], h2h["Draw"], h2h[away])
+        out["p_home"], out["p_draw"], out["p_away"] = ph, pdw, pa
+    return out
+
+
+def blend(model_p: float, market_p: Optional[float], alpha: float = MARKET_BLEND_ALPHA) -> float:
+    if market_p is None:
+        return model_p
+    return alpha * model_p + (1.0 - alpha) * market_p
+
+
 # ================= EDGE BASELINES =================
 MARKET_COLS = {
     "HOME WIN": "p_home",
@@ -691,6 +751,55 @@ def build_top20_mix(probs_df: pd.DataFrame, top_k: int = TOP_MIX) -> pd.DataFram
     return mix[["rank", "utcDate", "league", "home", "away", "bet", "prob", "confidence", "score", "adj", "penalty"]]
 
 
+# ================= BEST BETS (highest win probability, blended) =================
+BEST_BET_MARKETS = [
+    ("p_home", "HOME WIN"),
+    ("p_draw", "DRAW"),
+    ("p_away", "AWAY WIN"),
+    ("p_btts_yes", "BTTS YES"),
+    ("p_btts_no", "BTTS NO"),
+    ("p_over_1_5", "OVER 1.5"),
+    ("p_over_2_5", "OVER 2.5"),
+    ("p_under_2_5", "UNDER 2.5"),
+    ("p_1x", "DOUBLE CHANCE 1X"),
+    ("p_x2", "DOUBLE CHANCE X2"),
+]
+
+
+def build_best_bets(probs_df: pd.DataFrame) -> pd.DataFrame:
+    """One row per fixture: its single highest-probability outcome across
+    all markets, then every fixture ranked together by that probability,
+    descending. Confidence is used only as a tiebreaker, never to override
+    the probability ranking, so the tab's meaning stays literal."""
+    if probs_df.empty:
+        return pd.DataFrame()
+
+    rows = []
+    for _, r in probs_df.iterrows():
+        best_mkt, best_p = None, -1.0
+        for col, label in BEST_BET_MARKETS:
+            p = float(r.get(col, 0.0))
+            if p > best_p:
+                best_p, best_mkt = p, label
+
+        rows.append({
+            "utcDate": r["utcDate"],
+            "league": r["league"],
+            "home": r["home"],
+            "away": r["away"],
+            "bet": best_mkt,
+            "probability": round(best_p, 3),
+            "confidence": r["confidence"],
+            "has_market_odds": bool(r.get("has_market_odds", False)),
+        })
+
+    df = pd.DataFrame(rows).sort_values(
+        ["probability", "confidence"], ascending=[False, False]
+    ).reset_index(drop=True)
+    df.insert(0, "rank", range(1, len(df) + 1))
+    return df
+
+
 # ================= MAIN =================
 def main():
     log("=== START ===")
@@ -798,7 +907,7 @@ def main():
     ]
 
     visible_tabs = [
-        TAB_FIXTURES, TAB_TEAM_FORM, TAB_PICKS, TAB_TOP20, TAB_SAFE, TAB_BAL
+        TAB_FIXTURES, TAB_TEAM_FORM, TAB_PICKS, TAB_TOP20, TAB_SAFE, TAB_BAL, TAB_BEST_BETS
     ] + [t[2] for t in top10_specs]
 
     if rs_df.empty:
@@ -807,6 +916,7 @@ def main():
         write_df(TAB_TOP20, pd.DataFrame())
         write_df(TAB_SAFE, pd.DataFrame())
         write_df(TAB_BAL, pd.DataFrame())
+        write_df(TAB_BEST_BETS, pd.DataFrame())
         for _, _, tab in top10_specs:
             write_df(tab, pd.DataFrame())
         set_visible_tabs(visible_tabs)
@@ -822,6 +932,7 @@ def main():
         write_df(TAB_TOP20, pd.DataFrame())
         write_df(TAB_SAFE, pd.DataFrame())
         write_df(TAB_BAL, pd.DataFrame())
+        write_df(TAB_BEST_BETS, pd.DataFrame())
         for _, _, tab in top10_specs:
             write_df(tab, pd.DataFrame())
         set_visible_tabs(visible_tabs)
@@ -882,6 +993,24 @@ def main():
 
     probs_df = pd.DataFrame(probs_rows)
 
+    # ---- Blend model probabilities with de-vigged market odds ----
+    odds_map: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+    try:
+        odds_map = fetch_market_odds(fx_df)
+        log(f"matched odds for {len(odds_map)}/{len(fx_df)} fixtures")
+    except Exception as e:
+        log(f"odds integration skipped: {e}")
+
+    for i, row in probs_df.iterrows():
+        key = (row["league"], row["home"], row["away"])
+        mkt = market_probs_for_fixture(odds_map.get(key), row["home"], row["away"])
+        for col in ("p_home", "p_draw", "p_away"):
+            probs_df.at[i, col] = blend(float(row[col]), mkt.get(col))
+        probs_df.at[i, "p_1x"] = probs_df.at[i, "p_home"] + probs_df.at[i, "p_draw"]
+        probs_df.at[i, "p_x2"] = probs_df.at[i, "p_draw"] + probs_df.at[i, "p_away"]
+        probs_df.at[i, "p_12"] = probs_df.at[i, "p_home"] + probs_df.at[i, "p_away"]
+        probs_df.at[i, "has_market_odds"] = bool(mkt)
+
     # Picks tab
     def _pick_1x2(row: pd.Series) -> Tuple[str, float]:
         opts = [("HOME", row["p_home"]), ("DRAW", row["p_draw"]), ("AWAY", row["p_away"])]
@@ -924,6 +1053,9 @@ def main():
 
     write_df(TAB_SAFE, safe_df)
     write_df(TAB_BAL, bal_df)
+
+    # Best Bets tab: highest win probability across all games, blended with market odds
+    write_df(TAB_BEST_BETS, build_best_bets(probs_df))
 
     set_visible_tabs(visible_tabs)
     log("=== DONE ===")
