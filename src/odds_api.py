@@ -1,6 +1,6 @@
 from __future__ import annotations
 import requests
-from typing import Any, Iterable
+from typing import Any, Iterable, Optional
 import pandas as pd
 
 BASE = "https://api.the-odds-api.com/v4"
@@ -71,17 +71,14 @@ def flatten_odds(events: list[dict[str, Any]]) -> pd.DataFrame:
 
 
 # ================================================================
-# ADDED: pieces needed to blend model probabilities with market odds
-# and to match football-data.org fixtures to Odds API events.
+# Blending model probabilities with market odds, and matching
+# football-data.org fixtures to Odds API events.
 # ================================================================
 import difflib
 import re
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
-# Best-effort mapping from football-data.org competition codes to
-# The Odds API sport keys. VERIFY against OddsApi(...).list_sports()
-# before relying on this — coverage and key names can change.
 FD_TO_ODDS_SPORT = {
     "PL":  "soccer_epl",
     "PD":  "soccer_spain_la_liga",
@@ -94,9 +91,6 @@ FD_TO_ODDS_SPORT = {
     "EL1": "soccer_england_league1",
     "EL2": "soccer_england_league2",
     "SD":  "soccer_spain_segunda_division",
-    # SPL (Scottish Premiership) and others: add once confirmed via
-    # list_sports() — leaving unmapped competitions out just skips
-    # odds blending for them (falls back to model-only).
 }
 
 TEAM_STOPWORDS = re.compile(
@@ -127,8 +121,7 @@ def devig_two_way(odds_a: float, odds_b: float) -> Tuple[float, float]:
 
 
 def best_h2h_prices(event: Dict[str, Any]) -> Dict[str, float]:
-    """Best (highest) h2h price per outcome across bookmakers, taken
-    directly from a raw Odds API event (before flattening)."""
+    """Best (highest) h2h price per outcome across ALL bookmakers."""
     best: Dict[str, float] = {}
     for bm in event.get("bookmakers", []):
         for mkt in bm.get("markets", []):
@@ -142,6 +135,82 @@ def best_h2h_prices(event: Dict[str, Any]) -> Dict[str, float]:
     return best
 
 
+# ---- Named-bookmaker odds (Paddy Power / Boylesports) ----
+# The odds filter should reflect what YOU would actually be offered at
+# your own bookmaker, not a best-across-all-books blend that may not be
+# available to you. PREFERRED_BOOKMAKERS is checked in order.
+#
+# IMPORTANT: The Odds API's coverage of these two specific books is not
+# guaranteed — run check_bookmakers.py to see which are actually live
+# for your key. ODDS_FILTER_REQUIRE_NAMED_BOOK in main.py controls what
+# happens when neither is available for a fixture.
+PREFERRED_BOOKMAKERS = ["paddypower", "boylesports"]
+
+
+def named_h2h_prices(
+    event: Dict[str, Any], preferred: List[str] = None
+) -> Tuple[Dict[str, float], Optional[str]]:
+    """Returns (prices, bookmaker_key_used). First preferred bookmaker
+    that has an h2h market for this event wins. Returns ({}, None) if
+    none of them cover this event."""
+    preferred = preferred or PREFERRED_BOOKMAKERS
+    for want in preferred:
+        for bm in event.get("bookmakers", []):
+            if bm.get("key") != want:
+                continue
+            for mkt in bm.get("markets", []):
+                if mkt.get("key") != "h2h":
+                    continue
+                prices = {o["name"]: float(o["price"]) for o in mkt.get("outcomes", [])}
+                if prices:
+                    return prices, bm.get("key")
+    return {}, None
+
+
+def named_totals_prices(
+    event: Dict[str, Any], preferred: List[str] = None
+) -> Tuple[Dict[float, Dict[str, float]], Optional[str]]:
+    """Returns ({line: {'Over': price, 'Under': price}}, bookmaker_key)
+    for the totals (over/under goals) market."""
+    preferred = preferred or PREFERRED_BOOKMAKERS
+    for want in preferred:
+        for bm in event.get("bookmakers", []):
+            if bm.get("key") != want:
+                continue
+            for mkt in bm.get("markets", []):
+                if mkt.get("key") != "totals":
+                    continue
+                by_line: Dict[float, Dict[str, float]] = {}
+                for o in mkt.get("outcomes", []):
+                    point = o.get("point")
+                    if point is None:
+                        continue
+                    by_line.setdefault(float(point), {})[o["name"]] = float(o["price"])
+                if by_line:
+                    return by_line, bm.get("key")
+    return {}, None
+
+
+def all_totals_prices(event: Dict[str, Any]) -> Dict[float, Dict[str, float]]:
+    """Best totals price per line/side across ALL bookmakers (fallback)."""
+    best: Dict[float, Dict[str, float]] = {}
+    for bm in event.get("bookmakers", []):
+        for mkt in bm.get("markets", []):
+            if mkt.get("key") != "totals":
+                continue
+            for o in mkt.get("outcomes", []):
+                point = o.get("point")
+                if point is None:
+                    continue
+                line = float(point)
+                name = o["name"]
+                price = float(o["price"])
+                cur = best.setdefault(line, {})
+                if name not in cur or price > cur[name]:
+                    cur[name] = price
+    return best
+
+
 def match_fixture(
     fd_home: str,
     fd_away: str,
@@ -151,9 +220,8 @@ def match_fixture(
     min_match_score: float = 1.5,
 ) -> Optional[Dict[str, Any]]:
     """Fuzzy-match a football-data.org fixture to an Odds API event by
-    normalized team names + kickoff proximity. Returns None (no blend
-    for this fixture) rather than guessing, if nothing scores highly
-    enough — a wrong match would silently corrupt the model."""
+    normalized team names + kickoff proximity. Returns None rather than
+    guessing if nothing scores highly enough."""
     try:
         fd_dt = datetime.fromisoformat(fd_kickoff.replace("Z", "+00:00"))
     except Exception:
