@@ -1,17 +1,27 @@
-# Football Betting Bot
+# Football Betting Bot (Upgraded – Free Sources)
 
-Automated value betting bot for football matches using The Odds API and Google Sheets.
+Automated value-betting system using only free data sources.
+
+## Features
+- football-data.org + football-data.co.uk CSVs
+- Free xG from Understat + FBref (soccerdata + Scrapling fallback)
+- The Odds API with strong Paddy Power / BoyleSports preference
+- Optional Scrapling stealth enrichment for named books
+- Poisson model blended with xG
+- More leagues and markets
+- Google Sheets output + history / accuracy tracking
 
 ## Setup
 
-1. Add these **Secrets** in GitHub Settings → Secrets and variables → Actions:
-   - `ODDS_API_KEY`
-   - `GOOGLE_SERVICE_ACCOUNT_JSON`
-   - `SHEET_ID`
+### Secrets (GitHub Actions)
+- `ODDS_API_KEY`
+- `FOOTBALL_DATA_TOKEN`
+- `GOOGLE_SERVICE_ACCOUNT_JSON`
+- `SHEET_ID`
 
-2. Run manually from the **Actions** tab.
-
-## Project Structure
-- `src/` → Main Python code
-- `config/` → League settings
-- `.github/workflows/` → Daily automation
+### Local install
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+scrapling install
