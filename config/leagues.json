@@ -4,7 +4,8 @@
     "h2h",
     "totals",
     "btts",
-    "alternate_totals_cards"
+    "alternate_totals_cards",
+    "spreads"
   ],
   "target_leagues": [
     "Premier League",
@@ -18,11 +19,14 @@
     "Championship",
     "League One",
     "League Two",
-    "Segunda Divisi\u00f3n",
     "Scottish Premiership",
-    "Spain Segunda",
-    "Spain LaLiga2",
-    "Primera Divisi\u00f3n RFEF"
+    "Segunda División",
+    "Eredivisie",
+    "Primeira Liga",
+    "Belgian Pro League",
+    "Turkish Super Lig",
+    "Brazilian Serie A",
+    "MLS"
   ],
   "football_data_csv": {
     "E0": "https://www.football-data.co.uk/mmz4281/2526/E0.csv",
@@ -34,7 +38,33 @@
     "D1": "https://www.football-data.co.uk/mmz4281/2526/D1.csv",
     "I1": "https://www.football-data.co.uk/mmz4281/2526/I1.csv",
     "F1": "https://www.football-data.co.uk/mmz4281/2526/F1.csv",
-    "SC0": "https://www.football-data.co.uk/mmz4281/2526/SC0.csv"
+    "SC0": "https://www.football-data.co.uk/mmz4281/2526/SC0.csv",
+    "N1": "https://www.football-data.co.uk/mmz4281/2526/N1.csv",
+    "P1": "https://www.football-data.co.uk/mmz4281/2526/P1.csv",
+    "B1": "https://www.football-data.co.uk/mmz4281/2526/B1.csv",
+    "T1": "https://www.football-data.co.uk/mmz4281/2526/T1.csv"
   },
-  "rolling_window_matches": 12
+  "understat_leagues": {
+    "PL": "EPL",
+    "PD": "La_liga",
+    "SA": "Serie_A",
+    "BL1": "Bundesliga",
+    "FL1": "Ligue_1",
+    "RFPL": "RFPL"
+  },
+  "fbref_leagues": {
+    "PL": "ENG-Premier League",
+    "PD": "ESP-La Liga",
+    "SA": "ITA-Serie A",
+    "BL1": "GER-Bundesliga",
+    "FL1": "FRA-Ligue 1",
+    "ELC": "ENG-Championship",
+    "DED": "NED-Eredivisie",
+    "PPL": "POR-Primeira Liga"
+  },
+  "rolling_window_matches": 12,
+  "xg_weight": 0.65,
+  "goals_weight": 0.35,
+  "use_scrapling_fallback": true,
+  "preferred_bookmakers": ["paddypower", "boylesports"]
 }
