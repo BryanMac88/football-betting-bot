@@ -3,10 +3,9 @@ requests==2.32.3
 gspread==6.1.4
 google-auth==2.33.0
 python-dateutil==2.9.0.post0
-numpy>=1.26.0
-soccerdata>=1.8.0
-scrapling[fetchers]>=0.4.0
-lxml>=5.0.0
+numpy>=1.26.0,<2.3
+lxml>=4.9.3,<5.0.0
 beautifulsoup4>=4.12.0
 cloudscraper>=1.2.71
 tenacity>=8.2.0
+scrapling[fetchers]>=0.4.0
