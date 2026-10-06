@@ -36,19 +36,17 @@ from bet_tracking import (
 BASE_COMP_CODES = [
     "PL", "PD", "SA", "BL1", "FL1",          # Big 5
     "CL", "EL", "EC",                        # European cups
-    "ELC", "EL1", "EL2",                     # English Championship, L1, L2
+    "ELC", "EL1", "EL2",                     # Championship, League One, League Two
     "NL",                                    # English National League
     "SPL",                                   # Scottish Premiership
-    "SD",                                    # Spanish Segunda (2nd)
+    "SD",                                    # Spanish Segunda División (2nd)
     "SF",                                    # Spanish Primera Federación (3rd)
-    "DED", "PPL",                            # Eredivisie + Primeira
+    "DED", "PPL",                            # Eredivisie + Primeira Liga
 ]
 
 OPTIONAL_COMP_CODES = [
-    "BSA",  # Brazil Serie A
-    "MLS",  # Major League Soccer
-    "BJL",  # Belgian Pro League (if available)
-    "TSL",  # Turkish Super Lig (if available)
+    "BSA",   # Brazil Serie A
+    "MLS",   # Major League Soccer
 ]
 
 SLEEP_SECONDS = 7.0
