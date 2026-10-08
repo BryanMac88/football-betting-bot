@@ -1116,7 +1116,7 @@ def build_accuracy(history: pd.DataFrame) -> pd.DataFrame:
             "bets": n,
             "won": won,
             "lost": n - won,
-            "hit_rate": round(won / n, 3) if n else "",
+            "hit_rate": f"{round(won / n * 100)}%" if n else "",
             "avg_prob": round(sub["prob_num"].mean(), 3) if sub["prob_num"].notna().any() else "",
             "roi_per_bet": round(roi, 3) if roi is not None else "",
         })
