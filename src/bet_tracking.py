@@ -96,3 +96,54 @@ def _single_leg_result(leg: str, hg: int, ag: int) -> Optional[bool]:
         except (IndexError, ValueError):
             return None
     if b.startswith("UNDER "):
+        try:
+            return tot < float(b.split()[1])
+        except (IndexError, ValueError):
+            return None
+    return None
+
+
+def evaluate_bet(bet: str, hg: int, ag: int) -> Optional[bool]:
+    """Evaluate any bet label, including combined ones. A combined bet
+    wins only if EVERY leg wins. Returns None if any leg is an
+    unrecognised label — better to leave it unsettled than to record a
+    wrong result in the track record."""
+    legs = [l for l in str(bet).split("&")]
+    results = [_single_leg_result(l, hg, ag) for l in legs]
+    if any(r is None for r in results):
+        return None
+    return all(results)
+
+
+# ===================== ODDS HELPERS =====================
+def decimal_to_fractional(dec: float) -> str:
+    """Approximate fractional representation, for display only."""
+    try:
+        dec = float(dec)
+    except (TypeError, ValueError):
+        return ""
+    if dec <= 1:
+        return ""
+    profit = dec - 1.0
+    best = None
+    for denom in range(1, 51):
+        num = round(profit * denom)
+        if num <= 0:
+            continue
+        err = abs(profit - num / denom)
+        if best is None or err < best[0]:
+            best = (err, num, denom)
+    if best is None:
+        return ""
+    _, num, denom = best
+    return f"{num}/{denom}"
+
+
+def implied_prob(dec: float) -> Optional[float]:
+    try:
+        dec = float(dec)
+    except (TypeError, ValueError):
+        return None
+    if dec <= 1:
+        return None
+    return 1.0 / dec
