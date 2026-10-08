@@ -35,19 +35,19 @@ from performance import apply_performance_filter
 
 # ================= CONFIG =================
 BASE_COMP_CODES = [
-    "PL", "PD", "SA", "BL1", "FL1",          # Big 5
-    "CL", "EL", "EC",                        # European cups
-    "ELC", "EL1", "EL2",                     # Championship, League One, League Two
-    "NL",                                    # English National League
-    "SPL",                                   # Scottish Premiership
-    "SD",                                    # Spanish Segunda División (2nd)
-    "SF",                                    # Spanish Primera Federación (3rd)
-    "DED", "PPL",                            # Eredivisie + Primeira Liga
+    "PL", "PD", "SA", "BL1", "FL1",
+    "CL", "EL", "EC",
+    "ELC", "EL1", "EL2",
+    "NL",
+    "SPL",
+    "SD",
+    "SF",
+    "DED", "PPL",
 ]
 
 OPTIONAL_COMP_CODES = [
-    "BSA",   # Brazil Serie A
-    "MLS",   # Major League Soccer
+    "BSA",
+    "MLS",
 ]
 
 SLEEP_SECONDS = 7.0
@@ -61,40 +61,37 @@ TOP_MIX = 20
 UNIQUE_TEAMS_PER_TOP10 = True
 UNIQUE_TEAMS_IN_TOP20 = True
 
-# Recency weighting
 RECENT_N = 10
 RECENT_WEIGHT = 1.8
-
-# Bayesian shrinkage
 SHRINK_K = 8.0
 
-# Head-to-head (optional)
 USE_H2H = True
 H2H_MATCHES_LOOKBACK = 6
 H2H_SHRINK_K = 4.0
 H2H_MAX_GOAL_ADJ = 0.15
 H2H_BLEND = 0.35
 
-# Confidence
 CONF_K = 12.0
-
-# Market odds blend (model probability vs. de-vigged bookmaker probability)
 MARKET_BLEND_ALPHA = 0.5
 
-# ---- ODDS FILTER ----
 MIN_DECIMAL_ODDS = 1.20
 ODDS_FILTER_REQUIRE_NAMED_BOOK = False
 
-# ---- VALUE / EDGE FILTER ----
-# Only keep a pick if model probability beats the bookmaker's implied
-# probability by at least this amount (e.g. 0.04 = 4% edge)
+# Value / Edge filter
 MIN_EDGE = 0.04
 
-# ---- PERFORMANCE FILTER ----
+# Performance filter
 PERF_MIN_WIN_RATE = 0.52
 PERF_MIN_BETS = 8
 
-# Combo settings
+# Over 1.5 quality filter
+OVER_15_MIN_TOTAL_XG = 2.55          # only recommend Over 1.5 when expected goals are high enough
+
+# Staking
+BANKROLL = 1000.0                    # change this to your real bankroll
+KELLY_FRACTION = 0.25                # quarter Kelly (safer)
+MAX_STAKE_PCT = 0.04                 # never stake more than 4% of bankroll on one bet
+
 COMBO_MIN_PROB = 0.35
 COMBO_TOP_N = 25
 
@@ -146,12 +143,31 @@ def poisson(lam: float, k: int) -> float:
     return math.exp(-lam) * (lam ** k) / math.factorial(k)
 
 
+def kelly_stake(prob: float, odds: float, bankroll: float = BANKROLL,
+                fraction: float = KELLY_FRACTION, max_pct: float = MAX_STAKE_PCT) -> float:
+    """Quarter-Kelly stake, capped at max_pct of bankroll."""
+    try:
+        p = float(prob)
+        o = float(odds)
+    except (TypeError, ValueError):
+        return 0.0
+    if o <= 1.0 or p <= 0 or p >= 1:
+        return 0.0
+    b = o - 1.0
+    full_kelly = (p * (b + 1) - 1) / b
+    if full_kelly <= 0:
+        return 0.0
+    stake = bankroll * fraction * full_kelly
+    max_stake = bankroll * max_pct
+    return round(min(stake, max_stake), 2)
+
+
 # ================= SMART SCORE V2 =================
 def market_weight(bet: str) -> float:
     b = bet.upper()
     if b in ("HOME WIN", "AWAY WIN"):
         return 1.00
-    if b == "OVER 1.5":                     # boosted – best performer
+    if b == "OVER 1.5":
         return 1.08
     if b == "DRAW":
         return 0.88
@@ -225,10 +241,7 @@ def match_probs(lh: float, la: float) -> Dict[str, float]:
 
     p_home = p_draw = p_away = 0.0
     p_btts_yes = 0.0
-    p_over_0_5 = 0.0
-    p_over_1_5 = 0.0
-    p_over_2_5 = 0.0
-    p_over_3_5 = 0.0
+    p_over_0_5 = p_over_1_5 = p_over_2_5 = p_over_3_5 = 0.0
 
     for i in range(MAX_GOALS + 1):
         for j in range(MAX_GOALS + 1):
@@ -239,29 +252,18 @@ def match_probs(lh: float, la: float) -> Dict[str, float]:
                 p_draw += p
             else:
                 p_away += p
-
             if i > 0 and j > 0:
                 p_btts_yes += p
-
             tg = i + j
-            if tg > 0:
-                p_over_0_5 += p
-            if tg > 1:
-                p_over_1_5 += p
-            if tg > 2:
-                p_over_2_5 += p
-            if tg > 3:
-                p_over_3_5 += p
-
-    p_btts_no = 1.0 - p_btts_yes
-    p_1x = p_home + p_draw
-    p_x2 = p_draw + p_away
-    p_12 = p_home + p_away
+            if tg > 0: p_over_0_5 += p
+            if tg > 1: p_over_1_5 += p
+            if tg > 2: p_over_2_5 += p
+            if tg > 3: p_over_3_5 += p
 
     return {
         "p_home": p_home, "p_draw": p_draw, "p_away": p_away,
-        "p_1x": p_1x, "p_x2": p_x2, "p_12": p_12,
-        "p_btts_yes": p_btts_yes, "p_btts_no": p_btts_no,
+        "p_1x": p_home + p_draw, "p_x2": p_draw + p_away, "p_12": p_home + p_away,
+        "p_btts_yes": p_btts_yes, "p_btts_no": 1.0 - p_btts_yes,
         "p_over_0_5": p_over_0_5, "p_over_1_5": p_over_1_5,
         "p_over_2_5": p_over_2_5, "p_over_3_5": p_over_3_5,
         "p_under_1_5": 1.0 - p_over_1_5,
@@ -355,20 +357,14 @@ class FD:
     base: str = "https://api.football-data.org/v4"
 
     def get(self, path: str, params: Dict[str, Any] | None = None) -> Dict[str, Any]:
-        r = requests.get(
-            self.base + path,
-            headers={"X-Auth-Token": self.token},
-            params=params or {},
-            timeout=30,
-        )
+        r = requests.get(self.base + path, headers={"X-Auth-Token": self.token},
+                         params=params or {}, timeout=30)
         r.raise_for_status()
         return r.json()
 
     def matches(self, code: str, status: str, d1: str, d2: str) -> List[Dict[str, Any]]:
-        return self.get(
-            f"/competitions/{code}/matches",
-            {"status": status, "dateFrom": d1, "dateTo": d2},
-        ).get("matches", [])
+        return self.get(f"/competitions/{code}/matches",
+                        {"status": status, "dateFrom": d1, "dateTo": d2}).get("matches", [])
 
     def competitions(self) -> List[Dict[str, Any]]:
         return self.get("/competitions", {}).get("competitions", [])
@@ -475,7 +471,6 @@ def h2h_goal_adjustment(rs: pd.DataFrame, league: str, home: str, away: str) -> 
         return 0.0, 0.0
 
     sub = sub.tail(H2H_MATCHES_LOOKBACK)
-
     hg, ag = [], []
     for _, r in sub.iterrows():
         if r["home"] == home:
@@ -491,15 +486,9 @@ def h2h_goal_adjustment(rs: pd.DataFrame, league: str, home: str, away: str) -> 
 
     hmean = recency_weighted_mean(hg, min(RECENT_N, n), RECENT_WEIGHT)
     amean = recency_weighted_mean(ag, min(RECENT_N, n), RECENT_WEIGHT)
-
     mean_total = (hmean + amean) / 2.0
-    dh = (hmean - mean_total)
-    da = (amean - mean_total)
-
-    shrink_factor = n / (n + H2H_SHRINK_K)
-    dh *= shrink_factor * H2H_BLEND
-    da *= shrink_factor * H2H_BLEND
-
+    dh = (hmean - mean_total) * (n / (n + H2H_SHRINK_K)) * H2H_BLEND
+    da = (amean - mean_total) * (n / (n + H2H_SHRINK_K)) * H2H_BLEND
     return clamp(dh, -H2H_MAX_GOAL_ADJ, H2H_MAX_GOAL_ADJ), clamp(da, -H2H_MAX_GOAL_ADJ, H2H_MAX_GOAL_ADJ)
 
 
@@ -508,7 +497,7 @@ def confidence_score(n_home: float, n_away: float) -> float:
     return float(n / (n + CONF_K))
 
 
-# ================= MARKET ODDS INTEGRATION =================
+# ================= MARKET ODDS =================
 def fetch_market_odds(fx_df: pd.DataFrame) -> Dict[Tuple[str, str, str], Dict[str, Any]]:
     api = OddsApi(env("ODDS_API_KEY"))
     events_by_sport: Dict[str, List[Dict[str, Any]]] = {}
@@ -529,10 +518,8 @@ def fetch_market_odds(fx_df: pd.DataFrame) -> Dict[Tuple[str, str, str], Dict[st
             ev = match_fixture(r["home"], r["away"], r["utcDate"], events_by_sport[sport_key])
             if ev is None:
                 continue
-
             named_h2h, book_h2h = named_h2h_prices(ev)
             named_tot, book_tot = named_totals_prices(ev)
-
             matched[(league, r["home"], r["away"])] = {
                 "h2h": best_h2h_prices(ev),
                 "named_h2h": named_h2h,
@@ -565,15 +552,9 @@ def blend(model_p: float, market_p: Optional[float], alpha: float = MARKET_BLEND
     return alpha * model_p + (1.0 - alpha) * market_p
 
 
-def odds_for_bet(
-    odds_entry: Optional[Dict[str, Any]],
-    bet: str,
-    home: str,
-    away: str,
-) -> Tuple[Optional[float], str]:
+def odds_for_bet(odds_entry: Optional[Dict[str, Any]], bet: str, home: str, away: str) -> Tuple[Optional[float], str]:
     if not odds_entry:
         return None, "none"
-
     b = bet.strip().upper()
     named_h2h = odds_entry.get("named_h2h", {})
     named_tot = odds_entry.get("named_totals", {})
@@ -600,7 +581,6 @@ def odds_for_bet(
         if line in all_tot and side in all_tot[line]:
             return all_tot[line][side], "market-best"
         return None, "none"
-
     return None, "none"
 
 
@@ -615,7 +595,7 @@ def attach_odds(df: pd.DataFrame, odds_map: Dict[Tuple[str, str, str], Dict[str,
     if df is None or df.empty:
         return df
 
-    prices, fracs, sources, keeps = [], [], [], []
+    prices, fracs, sources, keeps, stakes = [], [], [], [], []
     for _, r in df.iterrows():
         entry = odds_map.get((r.get("league"), r.get("home"), r.get("away")))
         price, source = odds_for_bet(entry, str(r.get("bet", "")), r.get("home"), r.get("away"))
@@ -623,40 +603,36 @@ def attach_odds(df: pd.DataFrame, odds_map: Dict[Tuple[str, str, str], Dict[str,
         fracs.append(decimal_to_fractional(price) if price else "")
         sources.append(source)
         keeps.append(passes_odds_filter(price, source))
+        # stake recommendation
+        stake = kelly_stake(r.get("prob"), price) if price else 0.0
+        stakes.append(stake if stake > 0 else "")
 
     out = df.copy()
     out["odds"] = prices
     out["fractional"] = fracs
     out["odds_source"] = sources
+    out["stake"] = stakes
 
     if apply_filter:
         before = len(out)
         out = out[pd.Series(keeps, index=out.index)].reset_index(drop=True)
         dropped = before - len(out)
         if dropped:
-            log(f"  odds filter removed {dropped} pick(s) priced shorter than "
-                f"{MIN_DECIMAL_ODDS} ({decimal_to_fractional(MIN_DECIMAL_ODDS)})")
+            log(f"  odds filter removed {dropped} pick(s)")
         if "rank" in out.columns and not out.empty:
             out["rank"] = range(1, len(out) + 1)
     return out
 
 
 def apply_value_filter(df: pd.DataFrame, min_edge: float = MIN_EDGE) -> pd.DataFrame:
-    """
-    Keep only picks that have real odds AND where the model probability
-    beats the bookmaker implied probability by at least min_edge.
-    """
     if df is None or df.empty:
         return df
-
     if "odds" not in df.columns or "prob" not in df.columns:
         return df
 
     out = df.copy()
     out["_odds_num"] = pd.to_numeric(out["odds"], errors="coerce")
     out["_prob_num"] = pd.to_numeric(out["prob"], errors="coerce")
-
-    # implied probability = 1 / decimal odds
     out["_implied"] = 1.0 / out["_odds_num"]
     out["_edge"] = out["_prob_num"] - out["_implied"]
 
@@ -667,11 +643,32 @@ def apply_value_filter(df: pd.DataFrame, min_edge: float = MIN_EDGE) -> pd.DataF
         log(f"  value filter removed {dropped} pick(s) with edge < {min_edge:.0%}")
 
     out = out.drop(columns=["_odds_num", "_prob_num", "_implied", "_edge"], errors="ignore")
-
     if "rank" in out.columns and not out.empty:
         out = out.sort_values("score" if "score" in out.columns else "rank", ascending=False)
         out["rank"] = range(1, len(out) + 1)
+    return out.reset_index(drop=True)
 
+
+def apply_over15_quality_filter(df: pd.DataFrame) -> pd.DataFrame:
+    """Extra quality gate for OVER 1.5 picks."""
+    if df is None or df.empty or "bet" not in df.columns:
+        return df
+
+    out = df.copy()
+    mask = out["bet"].astype(str).str.upper() != "OVER 1.5"
+    # For Over 1.5 rows require total xG high enough
+    if "home_xg" in out.columns and "away_xg" in out.columns:
+        total_xg = pd.to_numeric(out["home_xg"], errors="coerce") + pd.to_numeric(out["away_xg"], errors="coerce")
+        over15_ok = total_xg >= OVER_15_MIN_TOTAL_XG
+        mask = mask | over15_ok
+
+    before = len(out)
+    out = out[mask].copy()
+    dropped = before - len(out)
+    if dropped:
+        log(f"  Over 1.5 quality filter removed {dropped} low-xG picks")
+    if "rank" in out.columns and not out.empty:
+        out["rank"] = range(1, len(out) + 1)
     return out.reset_index(drop=True)
 
 
@@ -710,19 +707,13 @@ def build_league_market_baselines(probs_df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def make_filtered_picks(
-    probs_df: pd.DataFrame,
-    baselines: pd.DataFrame,
-    rules: Dict[str, float],
-    max_rows: int = 30,
-    unique_teams: bool = True
-) -> pd.DataFrame:
+def make_filtered_picks(probs_df, baselines, rules, max_rows=30, unique_teams=True):
     if probs_df.empty or baselines.empty:
         return pd.DataFrame()
 
     base_map = {(r["league"], r["market"]): float(r["league_avg_prob"]) for _, r in baselines.iterrows()}
-
     picks = []
+
     for _, r in probs_df.iterrows():
         league, home, away = r["league"], r["home"], r["away"]
         conf = float(r["confidence"])
@@ -747,7 +738,6 @@ def make_filtered_picks(
                 continue
             edge = prob - league_avg
 
-            # OVER 1.5 gets a slightly more lenient edge requirement
             if mkt == "OVER 1.5":
                 min_edge = float(rules["edge_goals"]) * 0.75
             elif mkt in ("HOME WIN", "DRAW", "AWAY WIN"):
@@ -793,7 +783,7 @@ def make_filtered_picks(
     return df
 
 
-# ================= TOP10 / MIX HELPERS =================
+# ================= TOP10 / MIX =================
 CORE_COLS = ["utcDate", "league", "home", "away"]
 
 
@@ -805,21 +795,16 @@ def _dedupe_teams(df: pd.DataFrame, limit: int) -> pd.DataFrame:
         if h in used or a in used:
             continue
         kept.append(r)
-        if h:
-            used.add(h)
-        if a:
-            used.add(a)
+        if h: used.add(h)
+        if a: used.add(a)
         if len(kept) >= limit:
             break
-    if not kept:
-        return df.head(0)
-    return pd.DataFrame(kept).reset_index(drop=True)
+    return pd.DataFrame(kept).reset_index(drop=True) if kept else df.head(0)
 
 
-def top_n_for_market(probs_df: pd.DataFrame, prob_col: str, bet_label: str, top_n: int = TOP_N) -> pd.DataFrame:
+def top_n_for_market(probs_df, prob_col, bet_label, top_n=TOP_N):
     if probs_df is None or probs_df.empty:
         return pd.DataFrame()
-
     base_cols = CORE_COLS + ["confidence", "home_xg", "away_xg", "league_base_total", prob_col]
     df = probs_df[base_cols].copy().rename(columns={prob_col: "prob"})
     df["bet"] = bet_label
@@ -827,11 +812,9 @@ def top_n_for_market(probs_df: pd.DataFrame, prob_col: str, bet_label: str, top_
     df["confidence"] = pd.to_numeric(df["confidence"], errors="coerce")
     df = df.dropna(subset=["prob"])
 
-    scores = [
-        smart_score_v2(float(r["prob"]), float(r["confidence"]), bet_label,
-                       float(r["home_xg"]), float(r["away_xg"]), float(r["league_base_total"]))
-        for _, r in df.iterrows()
-    ]
+    scores = [smart_score_v2(float(r["prob"]), float(r["confidence"]), bet_label,
+                             float(r["home_xg"]), float(r["away_xg"]), float(r["league_base_total"]))
+              for _, r in df.iterrows()]
     df["score"] = [s[0] for s in scores]
     df["penalty"] = [s[1] for s in scores]
     df["adj"] = [s[2] for s in scores]
@@ -842,22 +825,20 @@ def top_n_for_market(probs_df: pd.DataFrame, prob_col: str, bet_label: str, top_
     return df[["rank", "utcDate", "league", "home", "away", "bet", "prob", "confidence", "score", "adj", "penalty"]]
 
 
-def build_top20_mix(probs_df: pd.DataFrame, top_k: int = TOP_MIX) -> pd.DataFrame:
+def build_top20_mix(probs_df, top_k=TOP_MIX):
     if probs_df is None or probs_df.empty:
         return pd.DataFrame()
 
-    def _all_for(col: str, label: str) -> pd.DataFrame:
+    def _all_for(col, label):
         d = probs_df[CORE_COLS + ["confidence", "home_xg", "away_xg", "league_base_total", col]].copy()
         d = d.rename(columns={col: "prob"})
         d["bet"] = label
         d["prob"] = pd.to_numeric(d["prob"], errors="coerce")
         d["confidence"] = pd.to_numeric(d["confidence"], errors="coerce")
         d = d.dropna(subset=["prob"])
-        scores = [
-            smart_score_v2(float(r["prob"]), float(r["confidence"]), label,
-                           float(r["home_xg"]), float(r["away_xg"]), float(r["league_base_total"]))
-            for _, r in d.iterrows()
-        ]
+        scores = [smart_score_v2(float(r["prob"]), float(r["confidence"]), label,
+                                 float(r["home_xg"]), float(r["away_xg"]), float(r["league_base_total"]))
+                  for _, r in d.iterrows()]
         d["score"] = [s[0] for s in scores]
         d["penalty"] = [s[1] for s in scores]
         d["adj"] = [s[2] for s in scores]
@@ -871,9 +852,7 @@ def build_top20_mix(probs_df: pd.DataFrame, top_k: int = TOP_MIX) -> pd.DataFram
         _all_for("p_1x", "DOUBLE CHANCE 1X"), _all_for("p_x2", "DOUBLE CHANCE X2"),
         _all_for("p_12", "DOUBLE CHANCE 12"),
     ]
-
-    mix = pd.concat(parts, ignore_index=True)
-    mix = mix.drop_duplicates(subset=["utcDate", "home", "away", "bet"])
+    mix = pd.concat(parts, ignore_index=True).drop_duplicates(subset=["utcDate", "home", "away", "bet"])
     mix = mix.sort_values(["score", "prob", "utcDate"], ascending=[False, False, True]).reset_index(drop=True)
     mix = _dedupe_teams(mix, top_k) if UNIQUE_TEAMS_IN_TOP20 else mix.head(top_k).reset_index(drop=True)
     mix.insert(0, "rank", range(1, len(mix) + 1))
@@ -889,10 +868,9 @@ BEST_BET_MARKETS = [
 ]
 
 
-def build_best_bets(probs_df: pd.DataFrame) -> pd.DataFrame:
+def build_best_bets(probs_df):
     if probs_df.empty:
         return pd.DataFrame()
-
     rows = []
     for _, r in probs_df.iterrows():
         best_mkt, best_p = None, -1.0
@@ -907,24 +885,21 @@ def build_best_bets(probs_df: pd.DataFrame) -> pd.DataFrame:
             "confidence": r["confidence"],
             "has_market_odds": bool(r.get("has_market_odds", False)),
         })
-
     df = pd.DataFrame(rows).sort_values(["prob", "confidence"], ascending=[False, False]).reset_index(drop=True)
     df.insert(0, "rank", range(1, len(df) + 1))
     return df
 
 
 # ================= COMBO BETS =================
-def build_combo_bets(probs_df: pd.DataFrame, top_k: int = COMBO_TOP_N) -> pd.DataFrame:
+def build_combo_bets(probs_df, top_k=COMBO_TOP_N):
     if probs_df is None or probs_df.empty:
         return pd.DataFrame()
-
     rows = []
     for _, r in probs_df.iterrows():
         lh, la = float(r["home_xg"]), float(r["away_xg"])
         conf = float(r["confidence"])
         base_tot = float(r["league_base_total"])
         cp = combo_probs(lh, la, MAX_GOALS)
-
         for label, prob in cp.items():
             if prob < COMBO_MIN_PROB:
                 continue
@@ -938,25 +913,23 @@ def build_combo_bets(probs_df: pd.DataFrame, top_k: int = COMBO_TOP_N) -> pd.Dat
                 "home_xg": round(lh, 2), "away_xg": round(la, 2),
                 "score": round(sc, 4),
             })
-
     df = pd.DataFrame(rows)
     if df.empty:
         return df
-
     df = df.sort_values(["score", "prob"], ascending=[False, False]).reset_index(drop=True)
     df = df.head(top_k).reset_index(drop=True)
     df.insert(0, "rank", range(1, len(df) + 1))
     return df
 
 
-# ================= BET HISTORY / TRACKING =================
+# ================= HISTORY / ACCURACY =================
 HISTORY_COLS = [
     "logged_utc", "utcDate", "league", "home", "away", "bet", "source",
-    "prob", "odds", "fractional", "odds_source", "result", "score", "profit",
+    "prob", "odds", "fractional", "odds_source", "stake", "result", "score", "profit",
 ]
 
 
-def _hist_key(row: Any) -> Tuple[str, str, str, str, str]:
+def _hist_key(row):
     return (
         str(row.get("utcDate", ""))[:10],
         str(row.get("home", "")),
@@ -966,22 +939,18 @@ def _hist_key(row: Any) -> Tuple[str, str, str, str, str]:
     )
 
 
-def append_new_picks(history: pd.DataFrame, picks: pd.DataFrame, source: str) -> pd.DataFrame:
+def append_new_picks(history, picks, source):
     if picks is None or picks.empty:
         return history
-
     existing = set()
     if not history.empty:
         for _, h in history.iterrows():
             existing.add(_hist_key(h))
-
     new_rows = []
     stamp = now().strftime("%Y-%m-%d %H:%M:%S UTC")
     for _, p in picks.iterrows():
-        cand = {
-            "utcDate": p.get("utcDate", ""), "home": p.get("home", ""),
-            "away": p.get("away", ""), "bet": p.get("bet", ""), "source": source,
-        }
+        cand = {"utcDate": p.get("utcDate", ""), "home": p.get("home", ""),
+                "away": p.get("away", ""), "bet": p.get("bet", ""), "source": source}
         if _hist_key(cand) in existing:
             continue
         new_rows.append({
@@ -996,38 +965,34 @@ def append_new_picks(history: pd.DataFrame, picks: pd.DataFrame, source: str) ->
             "odds": p.get("odds", ""),
             "fractional": p.get("fractional", ""),
             "odds_source": p.get("odds_source", ""),
+            "stake": p.get("stake", ""),
             "result": "PENDING",
             "score": "",
             "profit": "",
         })
-
     if not new_rows:
         return history
-
     log(f"  logging {len(new_rows)} new pick(s) from {source}")
     add = pd.DataFrame(new_rows)
     return add if history.empty else pd.concat([history, add], ignore_index=True)
 
 
-def settle_history(history: pd.DataFrame, rs_df: pd.DataFrame) -> pd.DataFrame:
+def settle_history(history, rs_df):
     if history is None or history.empty or rs_df is None or rs_df.empty:
         return history
-
-    results: Dict[Tuple[str, str, str], Tuple[int, int]] = {}
+    results = {}
     for _, r in rs_df.iterrows():
         key = (str(r["utcDate"])[:10], str(r["home"]), str(r["away"]))
         try:
             results[key] = (int(r["hg"]), int(r["ag"]))
         except (TypeError, ValueError):
             continue
-
     settled = 0
     out = history.copy()
     for col in ("result", "score", "profit"):
         if col not in out.columns:
             out[col] = ""
         out[col] = out[col].astype(object)
-
     for i, h in out.iterrows():
         if str(h.get("result", "")).upper() not in ("", "PENDING"):
             continue
@@ -1038,10 +1003,8 @@ def settle_history(history: pd.DataFrame, rs_df: pd.DataFrame) -> pd.DataFrame:
         won = evaluate_bet(str(h.get("bet", "")), hg, ag)
         if won is None:
             continue
-
         out.at[i, "result"] = "WON" if won else "LOST"
         out.at[i, "score"] = f"{hg}-{ag}"
-
         try:
             odds = float(h.get("odds", "") or 0)
         except (TypeError, ValueError):
@@ -1051,65 +1014,50 @@ def settle_history(history: pd.DataFrame, rs_df: pd.DataFrame) -> pd.DataFrame:
         else:
             out.at[i, "profit"] = ""
         settled += 1
-
     if settled:
         log(f"  settled {settled} previously-pending bet(s)")
     return out
 
 
-def _odds_bucket(odds: Any) -> str:
+def _odds_bucket(odds):
     try:
         o = float(odds)
     except (TypeError, ValueError):
         return "no price"
-    if o < 1.5:
-        return "1.20-1.49"
-    if o < 2.0:
-        return "1.50-1.99"
-    if o < 3.0:
-        return "2.00-2.99"
-    if o < 5.0:
-        return "3.00-4.99"
+    if o < 1.5: return "1.20-1.49"
+    if o < 2.0: return "1.50-1.99"
+    if o < 3.0: return "2.00-2.99"
+    if o < 5.0: return "3.00-4.99"
     return "5.00+"
 
 
-def build_accuracy(history: pd.DataFrame) -> pd.DataFrame:
+def build_accuracy(history):
     if history is None or history.empty:
         return pd.DataFrame()
-
     h = history.copy()
     h["result"] = h["result"].astype(str).str.upper()
     settled = h[h["result"].isin(["WON", "LOST"])].copy()
     if settled.empty:
         return pd.DataFrame([{
-            "grouping": "(nothing settled yet)",
-            "value": "", "bets": 0, "won": 0, "lost": 0,
+            "grouping": "(nothing settled yet)", "value": "", "bets": 0, "won": 0, "lost": 0,
             "hit_rate": "", "avg_prob": "", "roi_per_bet": "",
         }])
-
     settled["won_flag"] = (settled["result"] == "WON").astype(int)
     settled["prob_num"] = pd.to_numeric(settled["prob"], errors="coerce")
     settled["profit_num"] = pd.to_numeric(settled["profit"], errors="coerce")
     settled["bucket"] = settled["odds"].map(_odds_bucket)
-
     rows = []
-
-    def _summarise(grouping: str, value: str, sub: pd.DataFrame):
+    def _summarise(grouping, value, sub):
         n = len(sub)
         won = int(sub["won_flag"].sum())
         with_profit = sub.dropna(subset=["profit_num"])
         roi = with_profit["profit_num"].mean() if not with_profit.empty else None
         rows.append({
-            "grouping": grouping,
-            "value": value,
-            "bets": n,
-            "won": won,
-            "lost": n - won,
+            "grouping": grouping, "value": value, "bets": n, "won": won, "lost": n - won,
             "hit_rate": f"{round(won / n * 100)}%" if n else "",
             "avg_prob": round(sub["prob_num"].mean(), 3) if sub["prob_num"].notna().any() else "",
             "roi_per_bet": round(roi, 3) if roi is not None else "",
         })
-
     _summarise("OVERALL", "all bets", settled)
     for bet, sub in settled.groupby("bet"):
         _summarise("by bet type", str(bet), sub)
@@ -1117,7 +1065,6 @@ def build_accuracy(history: pd.DataFrame) -> pd.DataFrame:
         _summarise("by source tab", str(src), sub)
     for bucket, sub in settled.groupby("bucket"):
         _summarise("by odds band", str(bucket), sub)
-
     df = pd.DataFrame(rows)
     order = {"OVERALL": 0, "by bet type": 1, "by source tab": 2, "by odds band": 3}
     df["_o"] = df["grouping"].map(order).fillna(9)
@@ -1128,7 +1075,6 @@ def build_accuracy(history: pd.DataFrame) -> pd.DataFrame:
 def main():
     log("=== START ===")
     fd = FD(env("FOOTBALL_DATA_TOKEN"))
-
     today = now().date()
     f1 = today.isoformat()
     f2 = (today + timedelta(days=DAYS_AHEAD)).isoformat()
@@ -1148,9 +1094,7 @@ def main():
         comp_codes = [c for c in comp_codes if c in available_codes] + \
                      [c for c in BASE_COMP_CODES if c not in available_codes]
 
-    fixtures: List[Dict[str, Any]] = []
-    results: List[Dict[str, Any]] = []
-    access_rows: List[Dict[str, Any]] = []
+    fixtures, results, access_rows = [], [], []
 
     for code in comp_codes:
         time.sleep(SLEEP_SECONDS)
@@ -1161,19 +1105,12 @@ def main():
             log(f"{code} fixtures: {fx_n}")
             for m in fx:
                 fixtures.append({
-                    "league": code,
-                    "utcDate": m.get("utcDate"),
+                    "league": code, "utcDate": m.get("utcDate"),
                     "home": (m.get("homeTeam") or {}).get("name"),
                     "away": (m.get("awayTeam") or {}).get("name"),
                 })
-        except requests.HTTPError as e:
-            fx_ok = False
-            status = e.response.status_code if e.response is not None else None
-            fx_err = f"HTTP {status}"
-            log(f"skip fixtures {code}: {fx_err}")
         except Exception as e:
-            fx_ok = False
-            fx_err = str(e)
+            fx_ok, fx_err = False, str(e)
             log(f"skip fixtures {code}: {fx_err}")
 
         time.sleep(SLEEP_SECONDS)
@@ -1188,25 +1125,17 @@ def main():
                 if hg is None or ag is None:
                     continue
                 results.append({
-                    "league": code,
-                    "utcDate": m.get("utcDate") or "",
+                    "league": code, "utcDate": m.get("utcDate") or "",
                     "home": (m.get("homeTeam") or {}).get("name"),
                     "away": (m.get("awayTeam") or {}).get("name"),
                     "hg": int(hg), "ag": int(ag),
                 })
-        except requests.HTTPError as e:
-            rs_ok = False
-            status = e.response.status_code if e.response is not None else None
-            rs_err = f"HTTP {status}"
-            log(f"skip results {code}: {rs_err}")
         except Exception as e:
-            rs_ok = False
-            rs_err = str(e)
+            rs_ok, rs_err = False, str(e)
             log(f"skip results {code}: {rs_err}")
 
         access_rows.append({
-            "code": code,
-            "fixtures_ok": fx_ok, "fixtures_n": fx_n, "fixtures_err": fx_err,
+            "code": code, "fixtures_ok": fx_ok, "fixtures_n": fx_n, "fixtures_err": fx_err,
             "results_ok": rs_ok, "results_n": rs_n, "results_err": rs_err,
         })
 
@@ -1217,27 +1146,20 @@ def main():
     write_df(TAB_FIXTURES, sort_by_date(fx_df))
     write_df(TAB_ACCESS, access_df)
 
-    # Only keep the markets we still care about for Top10 tabs
-    top10_specs: List[Tuple[str, str, str]] = [
+    top10_specs = [
         ("p_over_1_5", "OVER 1.5", "Top10_Over_1_5"),
         ("p_over_2_5", "OVER 2.5", "Top10_Over_2_5"),
     ]
 
-    # Only these tabs will be visible
     visible_tabs = [
-        TAB_BEST_BETS,
-        "Top10_Over_1_5",
-        "Top10_Over_2_5",
-        TAB_COMBOS,
-        TAB_SAFE,
-        TAB_BAL,
-        TAB_ACCURACY,
+        TAB_BEST_BETS, "Top10_Over_1_5", "Top10_Over_2_5",
+        TAB_COMBOS, TAB_SAFE, TAB_BAL, TAB_ACCURACY,
     ]
 
     history = read_df(TAB_HISTORY)
     history = settle_history(history, rs_df)
 
-    def _finish_early(reason: str):
+    def _finish_early(reason):
         write_df(TAB_HISTORY, history if history is not None and not history.empty else pd.DataFrame())
         write_df(TAB_ACCURACY, build_accuracy(history))
         set_visible_tabs(visible_tabs)
@@ -1263,15 +1185,14 @@ def main():
         _finish_early("no fixtures")
         return
 
-    probs_rows: List[Dict[str, Any]] = []
+    probs_rows = []
     for _, r in fx_df.iterrows():
         league, home, away = r.get("league"), r.get("home"), r.get("away")
-
         base_home = safe_float(league_base.loc[league, "home_gf"], 1.35) if league in league_base.index else 1.35
         base_away = safe_float(league_base.loc[league, "away_gf"], 1.10) if league in league_base.index else 1.10
         league_base_total = base_home + base_away
 
-        def _get(team: str, col: str, default: float = 1.0) -> float:
+        def _get(team, col, default=1.0):
             try:
                 return float(team_idx.loc[(league, team), col])
             except Exception:
@@ -1286,11 +1207,9 @@ def main():
 
         lh = base_home * ha * ad
         la = base_away * aa * hd
-
         dh, da = h2h_goal_adjustment(rs_df, league, home, away)
         lh = max(0.2, lh + dh)
         la = max(0.2, la + da)
-
         conf = confidence_score(n_home, n_away)
         p = match_probs(lh, la)
 
@@ -1303,8 +1222,7 @@ def main():
 
     probs_df = pd.DataFrame(probs_rows)
 
-    # ---- Blend model probabilities with de-vigged market odds ----
-    odds_map: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+    odds_map = {}
     try:
         odds_map = fetch_market_odds(fx_df)
     except Exception as e:
@@ -1320,8 +1238,8 @@ def main():
         probs_df.at[i, "p_12"] = probs_df.at[i, "p_home"] + probs_df.at[i, "p_away"]
         probs_df.at[i, "has_market_odds"] = bool(mkt)
 
-    # ---- Picks tab (informational) ----
-    def _pick_1x2(row: pd.Series) -> Tuple[str, float]:
+    # Picks tab
+    def _pick_1x2(row):
         opts = [("HOME", row["p_home"]), ("DRAW", row["p_draw"]), ("AWAY", row["p_away"])]
         best = max(opts, key=lambda x: float(x[1]))
         return best[0], float(best[1])
@@ -1344,44 +1262,37 @@ def main():
         })
     write_df(TAB_PICKS, sort_by_date(pd.DataFrame(picks)))
 
-    # ---- Top10 tabs ----
     for col, label, tab in top10_specs:
         write_df(tab, sort_by_date(top_n_for_market(probs_df, col, label, TOP_N)))
 
-    # ---- Odds-filtered + Value-filtered + Performance-filtered outputs ----
-    log("applying odds filter + value filter + performance filter:")
-
-    log(" Top20_Mix:")
-    top20_df = attach_odds(build_top20_mix(probs_df, TOP_MIX), odds_map)
-    top20_df = apply_value_filter(top20_df)
-    top20_df = apply_performance_filter(top20_df, history, PERF_MIN_WIN_RATE, PERF_MIN_BETS)
-    write_df(TAB_TOP20, sort_by_date(top20_df))
+    log("applying filters (odds + value + performance + Over 1.5 quality):")
 
     baselines = build_league_market_baselines(probs_df)
 
     log(" Safe_Picks:")
     safe_df = attach_odds(make_filtered_picks(probs_df, baselines, SAFE_RULES, 20, True), odds_map)
     safe_df = apply_value_filter(safe_df)
+    safe_df = apply_over15_quality_filter(safe_df)
     safe_df = apply_performance_filter(safe_df, history, PERF_MIN_WIN_RATE, PERF_MIN_BETS)
     write_df(TAB_SAFE, sort_by_date(safe_df))
 
     log(" Balanced_Picks:")
     bal_df = attach_odds(make_filtered_picks(probs_df, baselines, BAL_RULES, 30, True), odds_map)
     bal_df = apply_value_filter(bal_df)
+    bal_df = apply_over15_quality_filter(bal_df)
     bal_df = apply_performance_filter(bal_df, history, PERF_MIN_WIN_RATE, PERF_MIN_BETS)
     write_df(TAB_BAL, sort_by_date(bal_df))
 
     log(" Best_Bets:")
     best_df = attach_odds(build_best_bets(probs_df), odds_map)
     best_df = apply_value_filter(best_df)
+    best_df = apply_over15_quality_filter(best_df)
     best_df = apply_performance_filter(best_df, history, PERF_MIN_WIN_RATE, PERF_MIN_BETS)
     write_df(TAB_BEST_BETS, sort_by_date(best_df))
 
-    # ---- Combined bets ----
     combos_df = build_combo_bets(probs_df, COMBO_TOP_N)
     write_df(TAB_COMBOS, sort_by_date(combos_df))
 
-    # ---- Log today's picks ----
     history = append_new_picks(history, best_df, "Best_Bets")
     history = append_new_picks(history, safe_df, "Safe_Picks")
     history = append_new_picks(history, bal_df, "Balanced_Picks")
@@ -1395,7 +1306,6 @@ def main():
 
     write_df(TAB_HISTORY, history)
     write_df(TAB_ACCURACY, build_accuracy(history))
-
     set_visible_tabs(visible_tabs)
     log("=== DONE ===")
 
