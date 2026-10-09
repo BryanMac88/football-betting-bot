@@ -49,7 +49,7 @@ H2H_BLEND = 0.35
 CONF_K = 12.0
 MARKET_BLEND_ALPHA = 0.5
 
-MIN_DECIMAL_ODDS = 1.40          # raised from 1.20
+MIN_DECIMAL_ODDS = 1.40
 MAX_DECIMAL_ODDS = 4.50
 ODDS_FILTER_REQUIRE_NAMED_BOOK = False
 MIN_EDGE = 0.04
@@ -63,6 +63,7 @@ MAX_STAKE_PCT = 0.04
 ARCHIVE_PENDING_DAYS = 14
 SHORTLIST_SIZE = 8
 SAMPLE_SIZE_WARNING = 15
+FALLBACK_SIZE = 3                    # how many bets to show when filters wipe everything
 
 COMBO_MIN_PROB = 0.35
 COMBO_TOP_N = 25
@@ -81,7 +82,7 @@ TAB_HISTORY = "Bet_History"
 TAB_ACCURACY = "Accuracy"
 TAB_SHORTLIST = "Todays_Shortlist"
 TAB_DASHBOARD = "Dashboard"
-TAB_CONFIG = "Config"               # optional tab for bankroll
+TAB_CONFIG = "Config"
 
 
 # ================= UTILS =================
@@ -266,7 +267,6 @@ def set_visible_tabs(keep_titles: List[str]):
         sh.batch_update({"requests": reqs})
 
 def get_bankroll() -> float:
-    """Read bankroll from Config!B2 if present, otherwise use default."""
     try:
         sh = open_sheet()
         ws = sh.worksheet(TAB_CONFIG)
@@ -473,7 +473,7 @@ def attach_odds(df, odds_map, bankroll, apply_filter=True):
     out["fractional"] = fracs
     out["odds_source"] = sources
     out["stake"] = stakes
-    out["closing_odds"] = ""          # CLV placeholder – fill manually or later
+    out["closing_odds"] = ""
     if apply_filter:
         before = len(out)
         out = out[pd.Series(keeps, index=out.index)].reset_index(drop=True)
@@ -515,6 +515,34 @@ def apply_over15_quality_filter(df):
     if "rank" in out.columns and not out.empty:
         out["rank"] = range(1, len(out) + 1)
     return out.reset_index(drop=True)
+
+
+# ================= NEVER-EMPTY FALLBACK =================
+def ensure_at_least_one(strict_df: pd.DataFrame, soft_df: pd.DataFrame, size: int = FALLBACK_SIZE) -> pd.DataFrame:
+    """
+    If the strict (high-quality) dataframe is empty, fall back to the soft version
+    and mark every row with a warning.
+    """
+    if strict_df is not None and not strict_df.empty:
+        out = strict_df.copy()
+        if "warning" not in out.columns:
+            out["warning"] = ""
+        return out
+
+    if soft_df is None or soft_df.empty:
+        return pd.DataFrame()
+
+    out = soft_df.copy()
+    if "score" in out.columns:
+        out = out.sort_values("score", ascending=False)
+    elif "prob" in out.columns:
+        out = out.sort_values("prob", ascending=False)
+
+    out = out.head(size).reset_index(drop=True)
+    out["warning"] = "BELOW ACCEPTABLE LEVEL – bet at your own risk"
+    out["rank"] = range(1, len(out) + 1)
+    log(f"  fallback used – showing {len(out)} lower-quality pick(s)")
+    return out
 
 
 # ================= PICK BUILDERS =================
@@ -634,7 +662,8 @@ def build_best_bets(probs_df):
             if p > best_p:
                 best_p, best_mkt = p, label
         rows.append({"utcDate": r["utcDate"], "league": r["league"], "home": r["home"], "away": r["away"],
-                     "bet": best_mkt, "prob": round(best_p, 3), "confidence": r["confidence"]})
+                     "bet": best_mkt, "prob": round(best_p, 3), "confidence": r["confidence"],
+                     "home_xg": r.get("home_xg"), "away_xg": r.get("away_xg")})
     df = pd.DataFrame(rows).sort_values(["prob", "confidence"], ascending=[False, False]).reset_index(drop=True)
     df.insert(0, "rank", range(1, len(df) + 1))
     return df
@@ -661,7 +690,6 @@ def build_combo_bets(probs_df, top_k=COMBO_TOP_N):
     return df
 
 def build_shortlist(best_df, safe_df, bal_df, size=SHORTLIST_SIZE):
-    """Combine the strongest picks into one clean shortlist."""
     frames = []
     for df, src in [(best_df, "Best"), (safe_df, "Safe"), (bal_df, "Balanced")]:
         if df is not None and not df.empty:
@@ -679,11 +707,10 @@ def build_shortlist(best_df, safe_df, bal_df, size=SHORTLIST_SIZE):
     mix = mix.head(size).reset_index(drop=True)
     mix.insert(0, "rank", range(1, len(mix) + 1))
     keep = ["rank", "utcDate", "league", "home", "away", "bet", "prob", "odds", "fractional",
-            "stake", "confidence", "score", "source", "odds_source"]
+            "stake", "confidence", "score", "source", "odds_source", "warning"]
     return mix[[c for c in keep if c in mix.columns]]
 
 def build_dashboard(shortlist, history, bankroll):
-    """Simple one-page summary."""
     rows = []
     rows.append({"metric": "Run time (UTC)", "value": now().strftime("%Y-%m-%d %H:%M")})
     rows.append({"metric": "Bankroll", "value": f"{bankroll:.0f}"})
@@ -956,46 +983,67 @@ def main():
         probs_df.at[i, "p_x2"] = probs_df.at[i, "p_draw"] + probs_df.at[i, "p_away"]
         probs_df.at[i, "p_12"] = probs_df.at[i, "p_home"] + probs_df.at[i, "p_away"]
 
-    # informational tabs
+    # ---------- Top10 tabs (with fallback) ----------
     for col, label, tab in top10_specs:
-        write_df(tab, sort_by_date(top_n_for_market(probs_df, col, label)))
+        soft = top_n_for_market(probs_df, col, label, TOP_N)
+        strict = soft.copy()  # Top10 is already soft
+        final = ensure_at_least_one(strict, soft, size=3)
+        write_df(tab, sort_by_date(final))
 
     baselines = build_league_market_baselines(probs_df)
 
-    log("Building filtered outputs...")
-    safe_df = attach_odds(make_filtered_picks(probs_df, baselines, SAFE_RULES, 20), odds_map, bankroll)
-    safe_df = apply_value_filter(safe_df)
-    safe_df = apply_over15_quality_filter(safe_df)
-    safe_df = apply_performance_filter(safe_df, history)
-    safe_df = apply_league_weighting(safe_df, history)
+    # ---------- Safe_Picks ----------
+    log("Safe_Picks...")
+    soft_safe = attach_odds(make_filtered_picks(probs_df, baselines, BAL_RULES, 30), odds_map, bankroll, apply_filter=False)
+    strict_safe = attach_odds(make_filtered_picks(probs_df, baselines, SAFE_RULES, 20), odds_map, bankroll)
+    strict_safe = apply_value_filter(strict_safe)
+    strict_safe = apply_over15_quality_filter(strict_safe)
+    strict_safe = apply_performance_filter(strict_safe, history)
+    strict_safe = apply_league_weighting(strict_safe, history)
+    safe_df = ensure_at_least_one(strict_safe, soft_safe)
     write_df(TAB_SAFE, sort_by_date(safe_df))
 
-    bal_df = attach_odds(make_filtered_picks(probs_df, baselines, BAL_RULES, 30), odds_map, bankroll)
-    bal_df = apply_value_filter(bal_df)
-    bal_df = apply_over15_quality_filter(bal_df)
-    bal_df = apply_performance_filter(bal_df, history)
-    bal_df = apply_league_weighting(bal_df, history)
+    # ---------- Balanced_Picks ----------
+    log("Balanced_Picks...")
+    soft_bal = attach_odds(make_filtered_picks(probs_df, baselines, BAL_RULES, 40), odds_map, bankroll, apply_filter=False)
+    strict_bal = attach_odds(make_filtered_picks(probs_df, baselines, BAL_RULES, 30), odds_map, bankroll)
+    strict_bal = apply_value_filter(strict_bal)
+    strict_bal = apply_over15_quality_filter(strict_bal)
+    strict_bal = apply_performance_filter(strict_bal, history)
+    strict_bal = apply_league_weighting(strict_bal, history)
+    bal_df = ensure_at_least_one(strict_bal, soft_bal)
     write_df(TAB_BAL, sort_by_date(bal_df))
 
-    best_df = attach_odds(build_best_bets(probs_df), odds_map, bankroll)
-    best_df = apply_value_filter(best_df)
-    best_df = apply_over15_quality_filter(best_df)
-    best_df = apply_performance_filter(best_df, history)
-    best_df = apply_league_weighting(best_df, history)
+    # ---------- Best_Bets ----------
+    log("Best_Bets...")
+    soft_best = attach_odds(build_best_bets(probs_df), odds_map, bankroll, apply_filter=False)
+    strict_best = attach_odds(build_best_bets(probs_df), odds_map, bankroll)
+    strict_best = apply_value_filter(strict_best)
+    strict_best = apply_over15_quality_filter(strict_best)
+    strict_best = apply_performance_filter(strict_best, history)
+    strict_best = apply_league_weighting(strict_best, history)
+    best_df = ensure_at_least_one(strict_best, soft_best)
     write_df(TAB_BEST_BETS, sort_by_date(best_df))
 
-    combos_df = build_combo_bets(probs_df)
+    # ---------- Combo_Bets ----------
+    log("Combo_Bets...")
+    soft_combos = build_combo_bets(probs_df, top_k=40)
+    strict_combos = build_combo_bets(probs_df, top_k=COMBO_TOP_N)
+    combos_df = ensure_at_least_one(strict_combos, soft_combos)
     write_df(TAB_COMBOS, sort_by_date(combos_df))
 
-    # Today's Shortlist
+    # ---------- Today's Shortlist ----------
     shortlist = build_shortlist(best_df, safe_df, bal_df)
+    if shortlist is None or shortlist.empty:
+        # ultimate fallback
+        shortlist = ensure_at_least_one(pd.DataFrame(), best_df, size=SHORTLIST_SIZE)
     write_df(TAB_SHORTLIST, sort_by_date(shortlist))
 
-    # Dashboard
+    # ---------- Dashboard ----------
     dashboard = build_dashboard(shortlist, history, bankroll)
     write_df(TAB_DASHBOARD, dashboard)
 
-    # History
+    # ---------- History ----------
     history = append_new_picks(history, best_df, "Best_Bets")
     history = append_new_picks(history, safe_df, "Safe_Picks")
     history = append_new_picks(history, bal_df, "Balanced_Picks")
