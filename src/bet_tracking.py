@@ -1,5 +1,6 @@
 """
-Prediction tracking + combined-bet (accumulator leg) probability maths.
+Prediction tracking + combined-bet probability maths.
+Only Over 1.5 combos are allowed.
 """
 from __future__ import annotations
 
@@ -17,7 +18,6 @@ def score_grid(lh: float, la: float, max_goals: int = 10) -> List[List[float]]:
     return [[ph[i] * pa[j] for j in range(max_goals + 1)] for i in range(max_goals + 1)]
 
 
-# Only combos that contain OVER 1.5 (your strongest market)
 COMBO_SPECS: List[Tuple[str, Callable[[int, int], bool]]] = [
     ("HOME WIN & OVER 1.5",          lambda i, j: i > j and (i + j) > 1),
     ("AWAY WIN & OVER 1.5",          lambda i, j: j > i and (i + j) > 1),
@@ -43,7 +43,6 @@ def combo_probs(lh: float, la: float, max_goals: int = 10) -> Dict[str, float]:
 def _single_leg_result(leg: str, hg: int, ag: int) -> Optional[bool]:
     b = leg.strip().upper()
     tot = hg + ag
-
     if b == "HOME WIN":
         return hg > ag
     if b == "AWAY WIN":
