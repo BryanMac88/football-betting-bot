@@ -63,7 +63,7 @@ MAX_STAKE_PCT = 0.04
 ARCHIVE_PENDING_DAYS = 14
 SHORTLIST_SIZE = 8
 SAMPLE_SIZE_WARNING = 15
-FALLBACK_SIZE = 3                    # how many bets to show when filters wipe everything
+FALLBACK_SIZE = 3
 
 COMBO_MIN_PROB = 0.35
 COMBO_TOP_N = 25
@@ -519,10 +519,6 @@ def apply_over15_quality_filter(df):
 
 # ================= NEVER-EMPTY FALLBACK =================
 def ensure_at_least_one(strict_df: pd.DataFrame, soft_df: pd.DataFrame, size: int = FALLBACK_SIZE) -> pd.DataFrame:
-    """
-    If the strict (high-quality) dataframe is empty, fall back to the soft version
-    and mark every row with a warning.
-    """
     if strict_df is not None and not strict_df.empty:
         out = strict_df.copy()
         if "warning" not in out.columns:
@@ -698,14 +694,22 @@ def build_shortlist(best_df, safe_df, bal_df, size=SHORTLIST_SIZE):
             frames.append(tmp)
     if not frames:
         return pd.DataFrame()
+
     mix = pd.concat(frames, ignore_index=True)
     mix = mix.drop_duplicates(subset=["utcDate", "home", "away", "bet"])
+
+    # Drop existing rank column if present (this was the bug)
+    if "rank" in mix.columns:
+        mix = mix.drop(columns=["rank"])
+
     if "score" in mix.columns:
         mix = mix.sort_values("score", ascending=False)
     elif "prob" in mix.columns:
         mix = mix.sort_values("prob", ascending=False)
+
     mix = mix.head(size).reset_index(drop=True)
     mix.insert(0, "rank", range(1, len(mix) + 1))
+
     keep = ["rank", "utcDate", "league", "home", "away", "bet", "prob", "odds", "fractional",
             "stake", "confidence", "score", "source", "odds_source", "warning"]
     return mix[[c for c in keep if c in mix.columns]]
@@ -983,11 +987,10 @@ def main():
         probs_df.at[i, "p_x2"] = probs_df.at[i, "p_draw"] + probs_df.at[i, "p_away"]
         probs_df.at[i, "p_12"] = probs_df.at[i, "p_home"] + probs_df.at[i, "p_away"]
 
-    # ---------- Top10 tabs (with fallback) ----------
+    # ---------- Top10 tabs ----------
     for col, label, tab in top10_specs:
         soft = top_n_for_market(probs_df, col, label, TOP_N)
-        strict = soft.copy()  # Top10 is already soft
-        final = ensure_at_least_one(strict, soft, size=3)
+        final = ensure_at_least_one(soft, soft, size=3)
         write_df(tab, sort_by_date(final))
 
     baselines = build_league_market_baselines(probs_df)
@@ -1035,7 +1038,6 @@ def main():
     # ---------- Today's Shortlist ----------
     shortlist = build_shortlist(best_df, safe_df, bal_df)
     if shortlist is None or shortlist.empty:
-        # ultimate fallback
         shortlist = ensure_at_least_one(pd.DataFrame(), best_df, size=SHORTLIST_SIZE)
     write_df(TAB_SHORTLIST, sort_by_date(shortlist))
 
