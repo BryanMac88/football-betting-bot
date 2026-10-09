@@ -28,7 +28,6 @@ def calculate_bet_type_performance(history: pd.DataFrame, min_bets: int = 8) -> 
 
 
 def calculate_league_performance(history: pd.DataFrame, min_bets: int = 6) -> Dict[Tuple[str, str], float]:
-    """Returns {(league, bet): win_rate}"""
     if history is None or history.empty:
         return {}
     if not all(c in history.columns for c in ["result", "bet", "league"]):
@@ -80,7 +79,6 @@ def apply_performance_filter(
 
 
 def apply_league_weighting(picks: pd.DataFrame, history: pd.DataFrame) -> pd.DataFrame:
-    """Boost or penalise score based on historical league + bet type performance."""
     if picks is None or picks.empty or "score" not in picks.columns:
         return picks
 
@@ -96,11 +94,11 @@ def apply_league_weighting(picks: pd.DataFrame, history: pd.DataFrame) -> pd.Dat
         if rate is None:
             adjustments.append(1.0)
         elif rate >= 0.60:
-            adjustments.append(1.12)      # strong league → boost
+            adjustments.append(1.12)
         elif rate >= 0.55:
             adjustments.append(1.05)
         elif rate < 0.45:
-            adjustments.append(0.85)      # weak league → penalise
+            adjustments.append(0.85)
         else:
             adjustments.append(1.0)
 
