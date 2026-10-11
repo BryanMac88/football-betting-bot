@@ -81,6 +81,7 @@ TAB_COMBOS = "Combo_Bets"
 TAB_HISTORY = "Bet_History"
 TAB_ACCURACY = "Accuracy"
 TAB_SHORTLIST = "Todays_Shortlist"
+TAB_ALL_GAMES = "All_Games_Best"
 TAB_DASHBOARD = "Dashboard"
 TAB_CONFIG = "Config"
 
@@ -802,6 +803,66 @@ def build_best_bets(probs_df):
     df.insert(0, "rank", range(1, len(df) + 1))
     return df
 
+
+def build_all_games_best(probs_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    One row per fixture: the single most probable outcome.
+    NO filters — every available game is included.
+    Sorted by league first, then kick-off time.
+    """
+    if probs_df is None or probs_df.empty:
+        return pd.DataFrame()
+
+    # Prefer 1X2 + goals + BTTS as the "main" outcomes for a full card
+    markets = [
+        ("p_home", "HOME WIN"),
+        ("p_draw", "DRAW"),
+        ("p_away", "AWAY WIN"),
+        ("p_btts_yes", "BTTS YES"),
+        ("p_btts_no", "BTTS NO"),
+        ("p_over_1_5", "OVER 1.5"),
+        ("p_over_2_5", "OVER 2.5"),
+        ("p_under_2_5", "UNDER 2.5"),
+        ("p_1x", "DOUBLE CHANCE 1X"),
+        ("p_x2", "DOUBLE CHANCE X2"),
+        ("p_12", "DOUBLE CHANCE 12"),
+    ]
+
+    rows = []
+    for _, r in probs_df.iterrows():
+        best_mkt, best_p = None, -1.0
+        for col, label in markets:
+            try:
+                p = float(r.get(col, 0) or 0)
+            except (TypeError, ValueError):
+                p = 0.0
+            if p > best_p:
+                best_p, best_mkt = p, label
+        if best_mkt is None:
+            continue
+        rows.append({
+            "league": r.get("league", ""),
+            "utcDate": r.get("utcDate", ""),
+            "home": r.get("home", ""),
+            "away": r.get("away", ""),
+            "bet": best_mkt,
+            "prob": round(best_p, 4),
+            "confidence": r.get("confidence", ""),
+            "home_xg": r.get("home_xg", ""),
+            "away_xg": r.get("away_xg", ""),
+        })
+
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows)
+    # Sort: league first, then kick-off
+    df["_dt"] = pd.to_datetime(df["utcDate"], errors="coerce", utc=True)
+    df = df.sort_values(["league", "_dt"], ascending=[True, True]).drop(columns=["_dt"])
+    df = df.reset_index(drop=True)
+    df.insert(0, "rank", range(1, len(df) + 1))
+    return df
+
 def build_combo_bets(probs_df, top_k=COMBO_TOP_N):
     if probs_df is None or probs_df.empty:
         return pd.DataFrame()
@@ -1056,7 +1117,7 @@ def main():
 
     top10_specs = [("p_over_1_5", "OVER 1.5", "Top10_Over_1_5"),
                    ("p_over_2_5", "OVER 2.5", "Top10_Over_2_5")]
-    visible_tabs = [TAB_BEST_BETS, "Top10_Over_1_5", "Top10_Over_2_5", TAB_COMBOS,
+    visible_tabs = [TAB_ALL_GAMES, TAB_BEST_BETS, "Top10_Over_1_5", "Top10_Over_2_5", TAB_COMBOS,
                     TAB_SAFE, TAB_BAL, TAB_SHORTLIST, TAB_DASHBOARD, TAB_ACCURACY]
 
     history = read_df(TAB_HISTORY)
@@ -1070,7 +1131,7 @@ def main():
         log(f"=== DONE ({reason}) ===")
 
     if rs_df.empty:
-        for t in (TAB_TEAM_FORM, TAB_PICKS, TAB_SAFE, TAB_BAL, TAB_BEST_BETS, TAB_COMBOS, TAB_SHORTLIST, TAB_DASHBOARD):
+        for t in (TAB_TEAM_FORM, TAB_PICKS, TAB_SAFE, TAB_BAL, TAB_BEST_BETS, TAB_ALL_GAMES, TAB_COMBOS, TAB_SHORTLIST, TAB_DASHBOARD):
             write_df(t, pd.DataFrame())
         for _, _, t in top10_specs:
             write_df(t, pd.DataFrame())
@@ -1082,7 +1143,7 @@ def main():
     write_df(TAB_TEAM_FORM, team_idx.reset_index())
 
     if fx_df.empty:
-        for t in (TAB_PICKS, TAB_SAFE, TAB_BAL, TAB_BEST_BETS, TAB_COMBOS, TAB_SHORTLIST, TAB_DASHBOARD):
+        for t in (TAB_PICKS, TAB_SAFE, TAB_BAL, TAB_BEST_BETS, TAB_ALL_GAMES, TAB_COMBOS, TAB_SHORTLIST, TAB_DASHBOARD):
             write_df(t, pd.DataFrame())
         for _, _, t in top10_specs:
             write_df(t, pd.DataFrame())
@@ -1165,6 +1226,11 @@ def main():
     strict_best = apply_league_weighting(strict_best, history)
     best_df = ensure_at_least_one(strict_best, soft_best)
     write_df(TAB_BEST_BETS, sort_by_date(best_df))
+
+    # ---------- All_Games_Best (every fixture, most probable outcome, sorted by league) ----------
+    log("All_Games_Best...")
+    all_games_df = attach_odds(build_all_games_best(probs_df), odds_map, bankroll, apply_filter=False)
+    write_df(TAB_ALL_GAMES, all_games_df)
 
     # ---------- Combo_Bets ----------
     log("Combo_Bets...")
