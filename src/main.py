@@ -100,8 +100,36 @@ def env(name: str) -> str:
 
 def safe_float(x: Any, default: float) -> float:
     try:
+        if isinstance(x, str):
+            s = x.strip().replace(",", "")
+            if s.endswith("%"):
+                return float(s.rstrip("%").strip()) / 100.0
+            x = s
         v = float(x)
         return default if math.isnan(v) else v
+    except Exception:
+        return default
+
+
+def parse_rate(x: Any, default: float = float("nan")) -> float:
+    """Parse 0.58, 58, or '58.00%' into a 0–1 rate."""
+    try:
+        if x is None or (isinstance(x, float) and math.isnan(x)):
+            return default
+        if isinstance(x, str):
+            s = x.strip().replace(",", "")
+            if not s or s.lower() in ("nan", "none", "-"):
+                return default
+            if s.endswith("%"):
+                return float(s.rstrip("%").strip()) / 100.0
+            v = float(s)
+        else:
+            v = float(x)
+        if math.isnan(v):
+            return default
+        if abs(v) > 1.5 and abs(v) <= 100:
+            return v / 100.0
+        return v
     except Exception:
         return default
 
@@ -216,15 +244,125 @@ def _get_or_create_ws(sh, title, rows=4000, cols=60):
     except gspread.WorksheetNotFound:
         return sh.add_worksheet(title, rows, cols)
 
+# Columns that are rates in ~0–1 range and must display as percentages
+PERCENT_COLUMNS = {
+    "prob", "confidence", "edge", "league_avg", "league_avg_prob",
+    "hit_rate", "avg_prob", "roi_per_bet", "win_rate", "recent_win_rate",
+    "break_even", "kelly", "stake_pct", "max_stake_pct",
+    "p_home", "p_draw", "p_away", "p_1x", "p_x2", "p_12",
+    "p_btts_yes", "p_btts_no",
+    "p_over_0_5", "p_over_1_5", "p_over_2_5", "p_over_3_5",
+    "p_under_1_5", "p_under_2_5", "p_under_3_5",
+}
+
+NUMBER_COLUMNS = {
+    "odds", "home_odds", "draw_odds", "away_odds", "home_xg", "away_xg",
+    "league_base_total", "profit", "rank", "bets", "won", "lost",
+    "n_home", "n_away", "hg", "ag", "fixtures_n", "results_n",
+    "score", "adj", "penalty", "stake", "bankroll", "model_implied_odds",
+}
+
+
+def _is_percent_col(name: str) -> bool:
+    n = str(name).strip().lower()
+    if n in PERCENT_COLUMNS:
+        return True
+    for token in ("prob", "rate", "pct", "percent", "confidence", "edge", "roi", "kelly"):
+        if token in n:
+            return True
+    return False
+
+
 def write_df(name: str, df: pd.DataFrame):
+    """Write a DataFrame and auto-format probability columns as 0.00%."""
     sh = open_sheet()
     ws = _get_or_create_ws(sh, name)
     ws.clear()
     if df is None or df.empty:
         ws.update([["(no data)"]])
-    else:
-        ws.update([list(df.columns)] + df.fillna("").astype(str).values.tolist(),
-                  value_input_option="USER_ENTERED")
+        return
+
+    out = df.copy()
+    cols = list(out.columns)
+    percent_idxs = [i for i, c in enumerate(cols) if _is_percent_col(c)]
+    number_idxs = [i for i, c in enumerate(cols) if str(c).strip().lower() in NUMBER_COLUMNS]
+
+    header = cols
+    rows: List[List[Any]] = []
+    for _, row in out.iterrows():
+        cells: List[Any] = []
+        for i, c in enumerate(cols):
+            val = row[c]
+            if pd.isna(val) or val is None or (isinstance(val, str) and str(val).strip() == ""):
+                cells.append("")
+                continue
+            if i in percent_idxs or i in number_idxs:
+                try:
+                    num = float(val)
+                    # If a % col was stored as 58 instead of 0.58, normalise
+                    if i in percent_idxs and abs(num) > 1.5 and abs(num) <= 100:
+                        num = num / 100.0
+                    cells.append(num)
+                except (TypeError, ValueError):
+                    cells.append(str(val))
+            else:
+                cells.append(str(val))
+        rows.append(cells)
+
+    ws.update([header] + rows, value_input_option="USER_ENTERED")
+
+    # Apply Sheets number formats so prob etc. show as 58.00%
+    if not rows:
+        return
+    sheet_id = ws.id
+    n_rows = len(rows)
+    reqs = []
+    for col_idx in percent_idxs:
+        reqs.append({
+            "repeatCell": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "startRowIndex": 1,
+                    "endRowIndex": n_rows + 1,
+                    "startColumnIndex": col_idx,
+                    "endColumnIndex": col_idx + 1,
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "numberFormat": {"type": "PERCENT", "pattern": "0.00%"}
+                    }
+                },
+                "fields": "userEnteredFormat.numberFormat",
+            }
+        })
+    for col_idx in number_idxs:
+        col_name = str(cols[col_idx]).lower()
+        pattern = "0" if col_name in (
+            "rank", "bets", "won", "lost", "n_home", "n_away",
+            "hg", "ag", "fixtures_n", "results_n",
+        ) else "0.00"
+        reqs.append({
+            "repeatCell": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "startRowIndex": 1,
+                    "endRowIndex": n_rows + 1,
+                    "startColumnIndex": col_idx,
+                    "endColumnIndex": col_idx + 1,
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "numberFormat": {"type": "NUMBER", "pattern": pattern}
+                    }
+                },
+                "fields": "userEnteredFormat.numberFormat",
+            }
+        })
+    if reqs:
+        try:
+            sh.batch_update({"requests": reqs})
+        except Exception as e:
+            print(f"number format apply failed on '{name}': {e}", flush=True)
 
 def read_df(name: str) -> pd.DataFrame:
     sh = open_sheet()
@@ -830,7 +968,7 @@ def build_accuracy(history):
         return pd.DataFrame([{"grouping": "(nothing settled yet)", "value": "", "bets": 0,
                               "won": 0, "lost": 0, "hit_rate": "", "avg_prob": "", "roi_per_bet": "", "note": ""}])
     settled["won_flag"] = (settled["result"] == "WON").astype(int)
-    settled["prob_num"] = pd.to_numeric(settled["prob"], errors="coerce")
+    settled["prob_num"] = settled["prob"].map(lambda x: parse_rate(x))
     settled["profit_num"] = pd.to_numeric(settled["profit"], errors="coerce")
     rows = []
     def _summ(grouping, value, sub):
