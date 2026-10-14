@@ -21,6 +21,9 @@ from odds_api import (
 )
 from bet_tracking import combo_probs, COMBO_SPECS, evaluate_bet, decimal_to_fractional
 from performance import apply_performance_filter, apply_league_weighting
+from odds_sources import (
+    get_fd_odds_cache, merge_odds_entry, model_implied_odds,
+)
 
 
 # ================= CONFIG =================
@@ -595,8 +598,28 @@ def fetch_market_odds(fx_df):
     except Exception as e:
         log(f"scrapling odds enrichment skipped: {e}")
 
-    with_named = sum(1 for v in matched.values() if v.get("named_h2h") or v.get("named_totals") or v.get("named_btts"))
-    log(f"odds matched: {len(matched)} fixtures ({with_named} with preferred-book prices)")
+    # ---- football-data.co.uk (Bet365 / market avg) — free, no key ----
+    try:
+        fd_cache = get_fd_odds_cache()
+        fd_cache.load_for_fixtures(list(fx_df["league"].unique()) if "league" in fx_df.columns else [])
+        filled_fd = 0
+        for _, r in fx_df.iterrows():
+            key = (r.get("league"), r.get("home"), r.get("away"))
+            fd_entry = fd_cache.lookup(r.get("league", ""), r.get("home", ""), r.get("away", ""))
+            if not fd_entry:
+                continue
+            if key in matched:
+                matched[key] = merge_odds_entry(matched[key], fd_entry)
+            else:
+                matched[key] = fd_entry
+            filled_fd += 1
+        if filled_fd:
+            log(f"  football-data.co.uk odds for {filled_fd} fixture(s)")
+    except Exception as e:
+        log(f"football-data.co.uk odds skipped: {e}")
+
+    with_named = sum(1 for v in matched.values() if v.get("named_h2h") or v.get("named_totals") or v.get("named_btts") or v.get("h2h"))
+    log(f"odds matched: {len(matched)} fixtures ({with_named} with bookmaker prices)")
     return matched
 
 def market_probs_for_fixture(odds_entry, home, away):
@@ -676,15 +699,21 @@ def passes_odds_filter(price, source):
     return MIN_DECIMAL_ODDS <= p <= MAX_DECIMAL_ODDS
 
 def attach_odds(df, odds_map, bankroll, apply_filter=True):
+    """Attach real bookmaker prices; fall back to model-implied so odds never blank."""
     if df is None or df.empty:
         return df
     prices, fracs, sources, keeps, stakes = [], [], [], [], []
     for _, r in df.iterrows():
         entry = odds_map.get((r.get("league"), r.get("home"), r.get("away")))
         price, source = odds_for_bet(entry, str(r.get("bet", "")), r.get("home"), r.get("away"))
+        # Guaranteed fallback: model-implied odds from probability
+        if price is None:
+            price = model_implied_odds(r.get("prob"))
+            if price is not None:
+                source = "model-implied"
         prices.append(round(price, 3) if price else "")
         fracs.append(decimal_to_fractional(price) if price else "")
-        sources.append(source)
+        sources.append(source or "none")
         keeps.append(passes_odds_filter(price, source))
         stakes.append(kelly_stake(r.get("prob"), price, bankroll) if price else "")
     out = df.copy()
@@ -695,11 +724,15 @@ def attach_odds(df, odds_map, bankroll, apply_filter=True):
     out["closing_odds"] = ""
     if apply_filter:
         before = len(out)
+        # Never drop picks solely because odds are model-implied
         out = out[pd.Series(keeps, index=out.index)].reset_index(drop=True)
         if before - len(out):
             log(f"  odds filter removed {before - len(out)} pick(s)")
         if "rank" in out.columns and not out.empty:
             out["rank"] = range(1, len(out) + 1)
+    n_real = sum(1 for s in sources if s and s not in ("none", "model-implied", "approx-1x2"))
+    n_model = sum(1 for s in sources if s == "model-implied")
+    log(f"  odds attached: {n_real} bookmaker, {n_model} model-implied, {len(prices)} total")
     return out
 
 def apply_value_filter(df, min_edge=MIN_EDGE):
