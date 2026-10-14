@@ -6,17 +6,20 @@ import pandas as pd
 BASE = "https://api.the-odds-api.com/v4"
 
 class OddsApi:
-    def __init__(self, api_key: str, region: str = "uk"):
+    """Client for The Odds API — live bookmaker decimal prices."""
+
+    def __init__(self, api_key: str, region: str = "uk,eu"):
         self.api_key = api_key
+        # uk + eu gives broader bookmaker coverage (PP, Boyle, Skybet, WH, etc.)
         self.region = region
 
     def list_sports(self) -> list[dict[str, Any]]:
-        r = requests.get(f"{BASE}/sports", params={"apiKey": self.api_key})
+        r = requests.get(f"{BASE}/sports", params={"apiKey": self.api_key}, timeout=30)
         r.raise_for_status()
         return r.json()
 
     def get_odds(self, sport_key: str, markets: Iterable[str]) -> list[dict[str, Any]]:
-        # Pull best odds across bookmakers for each market
+        """Pull live bookmaker odds for a sport (h2h / totals / btts)."""
         params = {
             "apiKey": self.api_key,
             "regions": self.region,
@@ -24,7 +27,11 @@ class OddsApi:
             "oddsFormat": "decimal",
             "dateFormat": "iso",
         }
-        r = requests.get(f"{BASE}/sports/{sport_key}/odds", params=params)
+        r = requests.get(
+            f"{BASE}/sports/{sport_key}/odds",
+            params=params,
+            timeout=45,
+        )
         r.raise_for_status()
         return r.json()
 
@@ -79,6 +86,7 @@ import re
 from datetime import datetime
 from typing import Dict, List, Tuple
 
+# football-data.org competition code → The Odds API sport key
 FD_TO_ODDS_SPORT = {
     "PL":  "soccer_epl",
     "PD":  "soccer_spain_la_liga",
@@ -87,10 +95,21 @@ FD_TO_ODDS_SPORT = {
     "FL1": "soccer_france_ligue_one",
     "CL":  "soccer_uefa_champs_league",
     "EL":  "soccer_uefa_europa_league",
+    "EC":  "soccer_uefa_europa_conference_league",
     "ELC": "soccer_efl_champ",
     "EL1": "soccer_england_league1",
     "EL2": "soccer_england_league2",
+    "ENL": "soccer_england_national_league",
+    "NL":  "soccer_england_national_league",
     "SD":  "soccer_spain_segunda_division",
+    "SF":  "soccer_spain_segunda_division",  # closest free mapping for 3rd tier
+    "SPL": "soccer_spl",
+    "DED": "soccer_netherlands_eredivisie",
+    "PPL": "soccer_portugal_primeira_liga",
+    "BSA": "soccer_brazil_campeonato",
+    "MLS": "soccer_usa_mls",
+    "BJL": "soccer_belgium_first_div",
+    "TSL": "soccer_turkey_super_league",
 }
 
 TEAM_STOPWORDS = re.compile(
@@ -144,7 +163,19 @@ def best_h2h_prices(event: Dict[str, Any]) -> Dict[str, float]:
 # guaranteed — run check_bookmakers.py to see which are actually live
 # for your key. ODDS_FILTER_REQUIRE_NAMED_BOOK in main.py controls what
 # happens when neither is available for a fixture.
-PREFERRED_BOOKMAKERS = ["paddypower", "boylesports"]
+# Prefer UK retail books you can actually bet with, then strong EU books
+PREFERRED_BOOKMAKERS = [
+    "paddypower",
+    "boylesports",
+    "skybet",
+    "williamhill",
+    "ladbrokes",
+    "coral",
+    "betfair_sb_uk",
+    "unibet_uk",
+    "bet365",
+    "pinnacle",
+]
 
 
 def named_h2h_prices(
@@ -165,6 +196,40 @@ def named_h2h_prices(
                 if prices:
                     return prices, bm.get("key")
     return {}, None
+
+
+def named_btts_prices(
+    event: Dict[str, Any], preferred: List[str] = None
+) -> Tuple[Dict[str, float], Optional[str]]:
+    """Both Teams To Score prices from preferred bookmakers.
+    Returns ({'Yes': price, 'No': price}, bookmaker_key)."""
+    preferred = preferred or PREFERRED_BOOKMAKERS
+    for want in preferred:
+        for bm in event.get("bookmakers", []):
+            if bm.get("key") != want:
+                continue
+            for mkt in bm.get("markets", []):
+                if mkt.get("key") != "btts":
+                    continue
+                prices = {o["name"]: float(o["price"]) for o in mkt.get("outcomes", [])}
+                if prices:
+                    return prices, bm.get("key")
+    return {}, None
+
+
+def best_btts_prices(event: Dict[str, Any]) -> Dict[str, float]:
+    """Best BTTS price per Yes/No across all bookmakers."""
+    best: Dict[str, float] = {}
+    for bm in event.get("bookmakers", []):
+        for mkt in bm.get("markets", []):
+            if mkt.get("key") != "btts":
+                continue
+            for outcome in mkt.get("outcomes", []):
+                name = outcome["name"]
+                price = float(outcome["price"])
+                if name not in best or price > best[name]:
+                    best[name] = price
+    return best
 
 
 def named_totals_prices(
