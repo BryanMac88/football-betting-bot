@@ -659,7 +659,7 @@ def apply_over15_quality_filter(df):
 # ================= NEVER-EMPTY FALLBACK =================
 def ensure_at_least_one(strict_df: pd.DataFrame, soft_df: pd.DataFrame, size: int = FALLBACK_SIZE) -> pd.DataFrame:
     if strict_df is not None and not strict_df.empty:
-        out = strict_df.copy()
+        out = _dedupe_matches(strict_df.copy())
         if "warning" not in out.columns:
             out["warning"] = ""
         return out
@@ -673,9 +673,12 @@ def ensure_at_least_one(strict_df: pd.DataFrame, soft_df: pd.DataFrame, size: in
     elif "prob" in out.columns:
         out = out.sort_values("prob", ascending=False)
 
-    out = out.head(size).reset_index(drop=True)
+    out = _dedupe_matches(out, limit=size)
     out["warning"] = "BELOW ACCEPTABLE LEVEL – bet at your own risk"
-    out["rank"] = range(1, len(out) + 1)
+    if "rank" in out.columns:
+        out["rank"] = range(1, len(out) + 1)
+    else:
+        out.insert(0, "rank", range(1, len(out) + 1))
     log(f"  fallback used – showing {len(out)} lower-quality pick(s)")
     return out
 
@@ -734,30 +737,84 @@ def make_filtered_picks(probs_df, baselines, rules, max_rows=30, unique_teams=Tr
     if df.empty:
         return df
     df = df.sort_values(["score", "edge", "prob"], ascending=[False, False, False]).reset_index(drop=True)
+    # Always one bet per match first
+    df = _dedupe_matches(df, limit=None)
     if unique_teams:
-        used, keep = set(), []
-        for _, row in df.iterrows():
-            if row["home"] in used or row["away"] in used:
-                continue
-            keep.append(row)
-            used.add(row["home"]); used.add(row["away"])
-            if len(keep) >= max_rows:
-                break
-        df = pd.DataFrame(keep)
-    df.insert(0, "rank", range(1, len(df) + 1))
+        df = _dedupe_teams(df, max_rows)
+    else:
+        df = df.head(max_rows).reset_index(drop=True)
+    if "rank" in df.columns:
+        df["rank"] = range(1, len(df) + 1)
+    else:
+        df.insert(0, "rank", range(1, len(df) + 1))
     return df
 
 CORE_COLS = ["utcDate", "league", "home", "away"]
 
+def _match_key(row) -> Tuple[str, str, str]:
+    """Identity of a fixture — used to enforce one bet per game."""
+    return (
+        str(row.get("utcDate", ""))[:16],
+        str(row.get("home", "")).strip().lower(),
+        str(row.get("away", "")).strip().lower(),
+    )
+
+
+def _dedupe_matches(df: pd.DataFrame, limit: Optional[int] = None) -> pd.DataFrame:
+    """
+    Keep only ONE row per fixture (best already-sorted first).
+    Prevents the same game appearing with multiple different bets on a tab.
+    """
+    if df is None or df.empty:
+        return df if df is not None else pd.DataFrame()
+
+    # Prefer higher score / prob if not already sorted
+    out = df.copy()
+    sort_cols = []
+    if "score" in out.columns:
+        sort_cols.append("score")
+    if "prob" in out.columns:
+        sort_cols.append("prob")
+    if "edge" in out.columns:
+        sort_cols.append("edge")
+    if sort_cols:
+        out = out.sort_values(sort_cols, ascending=[False] * len(sort_cols))
+
+    seen, kept = set(), []
+    for _, row in out.iterrows():
+        key = _match_key(row)
+        if key in seen:
+            continue
+        if not key[1] and not key[2]:
+            continue
+        seen.add(key)
+        kept.append(row)
+        if limit is not None and len(kept) >= limit:
+            break
+
+    if not kept:
+        return out.head(0)
+
+    result = pd.DataFrame(kept).reset_index(drop=True)
+    if "rank" in result.columns:
+        result["rank"] = range(1, len(result) + 1)
+    else:
+        result.insert(0, "rank", range(1, len(result) + 1))
+    return result
+
+
 def _dedupe_teams(df, limit):
+    """One pick per team (stricter than match-level — used for Top10 lists)."""
     used, kept = set(), []
     for _, r in df.iterrows():
         h, a = r.get("home"), r.get("away")
         if h in used or a in used:
             continue
         kept.append(r)
-        if h: used.add(h)
-        if a: used.add(a)
+        if h:
+            used.add(h)
+        if a:
+            used.add(a)
         if len(kept) >= limit:
             break
     return pd.DataFrame(kept).reset_index(drop=True) if kept else df.head(0)
@@ -880,8 +937,9 @@ def build_combo_bets(probs_df, top_k=COMBO_TOP_N):
     df = pd.DataFrame(rows)
     if df.empty:
         return df
-    df = df.sort_values(["score", "prob"], ascending=[False, False]).head(top_k).reset_index(drop=True)
-    df.insert(0, "rank", range(1, len(df) + 1))
+    df = df.sort_values(["score", "prob"], ascending=[False, False]).reset_index(drop=True)
+    # One combo per match only (best scoring combo wins)
+    df = _dedupe_matches(df, limit=top_k)
     return df
 
 def build_shortlist(best_df, safe_df, bal_df, size=SHORTLIST_SIZE):
@@ -895,9 +953,8 @@ def build_shortlist(best_df, safe_df, bal_df, size=SHORTLIST_SIZE):
         return pd.DataFrame()
 
     mix = pd.concat(frames, ignore_index=True)
-    mix = mix.drop_duplicates(subset=["utcDate", "home", "away", "bet"])
 
-    # Drop existing rank column if present (this was the bug)
+    # Drop existing rank column if present
     if "rank" in mix.columns:
         mix = mix.drop(columns=["rank"])
 
@@ -906,8 +963,8 @@ def build_shortlist(best_df, safe_df, bal_df, size=SHORTLIST_SIZE):
     elif "prob" in mix.columns:
         mix = mix.sort_values("prob", ascending=False)
 
-    mix = mix.head(size).reset_index(drop=True)
-    mix.insert(0, "rank", range(1, len(mix) + 1))
+    # One bet per match — never the same game twice with different markets
+    mix = _dedupe_matches(mix, limit=size)
 
     keep = ["rank", "utcDate", "league", "home", "away", "bet", "prob", "odds", "fractional",
             "stake", "confidence", "score", "source", "odds_source", "warning"]
@@ -1202,7 +1259,7 @@ def main():
     strict_safe = apply_over15_quality_filter(strict_safe)
     strict_safe = apply_performance_filter(strict_safe, history)
     strict_safe = apply_league_weighting(strict_safe, history)
-    safe_df = ensure_at_least_one(strict_safe, soft_safe)
+    safe_df = _dedupe_matches(ensure_at_least_one(strict_safe, soft_safe))
     write_df(TAB_SAFE, sort_by_date(safe_df))
 
     # ---------- Balanced_Picks ----------
@@ -1213,7 +1270,7 @@ def main():
     strict_bal = apply_over15_quality_filter(strict_bal)
     strict_bal = apply_performance_filter(strict_bal, history)
     strict_bal = apply_league_weighting(strict_bal, history)
-    bal_df = ensure_at_least_one(strict_bal, soft_bal)
+    bal_df = _dedupe_matches(ensure_at_least_one(strict_bal, soft_bal))
     write_df(TAB_BAL, sort_by_date(bal_df))
 
     # ---------- Best_Bets ----------
@@ -1224,7 +1281,7 @@ def main():
     strict_best = apply_over15_quality_filter(strict_best)
     strict_best = apply_performance_filter(strict_best, history)
     strict_best = apply_league_weighting(strict_best, history)
-    best_df = ensure_at_least_one(strict_best, soft_best)
+    best_df = _dedupe_matches(ensure_at_least_one(strict_best, soft_best))
     write_df(TAB_BEST_BETS, sort_by_date(best_df))
 
     # ---------- All_Games_Best (every fixture, most probable outcome, sorted by league) ----------
@@ -1236,7 +1293,7 @@ def main():
     log("Combo_Bets...")
     soft_combos = build_combo_bets(probs_df, top_k=40)
     strict_combos = build_combo_bets(probs_df, top_k=COMBO_TOP_N)
-    combos_df = ensure_at_least_one(strict_combos, soft_combos)
+    combos_df = _dedupe_matches(ensure_at_least_one(strict_combos, soft_combos))
     write_df(TAB_COMBOS, sort_by_date(combos_df))
 
     # ---------- Today's Shortlist ----------
