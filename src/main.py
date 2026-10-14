@@ -17,6 +17,7 @@ from odds_api import (
     OddsApi, FD_TO_ODDS_SPORT, best_h2h_prices, named_h2h_prices,
     named_totals_prices, all_totals_prices, devig_three_way,
     match_fixture, PREFERRED_BOOKMAKERS,
+    named_btts_prices, best_btts_prices,
 )
 from bet_tracking import combo_probs, COMBO_SPECS, evaluate_bet, decimal_to_fractional
 from performance import apply_performance_filter, apply_league_weighting
@@ -522,6 +523,7 @@ def confidence_score(n_home, n_away):
 
 # ================= ODDS =================
 def fetch_market_odds(fx_df):
+    """Pull live bookmaker prices from The Odds API (h2h + totals + BTTS)."""
     api = OddsApi(env("ODDS_API_KEY"))
     events_by_sport = {}
     matched = {}
@@ -531,7 +533,11 @@ def fetch_market_odds(fx_df):
             continue
         if sport_key not in events_by_sport:
             try:
-                events_by_sport[sport_key] = api.get_odds(sport_key, markets=["h2h", "totals"])
+                # Live bookmaker prices: 1X2, totals, BTTS
+                events_by_sport[sport_key] = api.get_odds(
+                    sport_key, markets=["h2h", "totals", "btts"]
+                )
+                log(f"  odds API {sport_key}: {len(events_by_sport[sport_key])} events")
             except Exception as e:
                 log(f"odds fetch failed for {sport_key}: {e}")
                 events_by_sport[sport_key] = []
@@ -541,12 +547,56 @@ def fetch_market_odds(fx_df):
                 continue
             named_h2h, book_h2h = named_h2h_prices(ev)
             named_tot, book_tot = named_totals_prices(ev)
+            named_btts, book_btts = named_btts_prices(ev)
             matched[(league, r["home"], r["away"])] = {
-                "h2h": best_h2h_prices(ev), "named_h2h": named_h2h,
-                "named_totals": named_tot, "all_totals": all_totals_prices(ev),
-                "book": book_h2h or book_tot, "event": ev,
+                "h2h": best_h2h_prices(ev),
+                "named_h2h": named_h2h,
+                "named_totals": named_tot,
+                "all_totals": all_totals_prices(ev),
+                "named_btts": named_btts,
+                "btts": best_btts_prices(ev),
+                "book": book_h2h or book_tot or book_btts,
+                "event": ev,
             }
-    log(f"odds matched: {len(matched)} fixtures")
+    # Optional Scrapling fallback for fixtures still missing preferred-book prices
+    try:
+        from scrapling_odds import enrich_named_odds, _normalize as _odds_norm
+        missing = []
+        for _, r in fx_df.iterrows():
+            key = (r.get("league"), r.get("home"), r.get("away"))
+            entry = matched.get(key)
+            if entry is None or not entry.get("named_h2h"):
+                missing.append({"league": r.get("league"), "home": r.get("home"), "away": r.get("away")})
+        if missing:
+            scraped = enrich_named_odds(missing)
+            filled = 0
+            for item in missing:
+                nk = (_odds_norm(item["home"]), _odds_norm(item["away"]))
+                row = scraped.get(nk)
+                if not row:
+                    continue
+                key = (item["league"], item["home"], item["away"])
+                entry = matched.get(key) or {
+                    "h2h": {}, "named_h2h": {}, "named_totals": {},
+                    "all_totals": {}, "named_btts": {}, "btts": {},
+                    "book": None, "event": None,
+                }
+                entry["named_h2h"] = {
+                    item["home"]: row["home"],
+                    "Draw": row["draw"],
+                    item["away"]: row["away"],
+                }
+                entry["book"] = row.get("book", "paddypower")
+                entry["h2h"] = entry.get("h2h") or entry["named_h2h"]
+                matched[key] = entry
+                filled += 1
+            if filled:
+                log(f"  scrapling filled named odds for {filled} fixture(s)")
+    except Exception as e:
+        log(f"scrapling odds enrichment skipped: {e}")
+
+    with_named = sum(1 for v in matched.values() if v.get("named_h2h") or v.get("named_totals") or v.get("named_btts"))
+    log(f"odds matched: {len(matched)} fixtures ({with_named} with preferred-book prices)")
     return matched
 
 def market_probs_for_fixture(odds_entry, home, away):
@@ -563,19 +613,34 @@ def blend(model_p, market_p, alpha=MARKET_BLEND_ALPHA):
     return model_p if market_p is None else alpha * model_p + (1 - alpha) * market_p
 
 def odds_for_bet(odds_entry, bet, home, away):
+    """Resolve a real bookmaker decimal price for a pick."""
     if not odds_entry:
         return None, "none"
     b = bet.strip().upper()
     named_h2h = odds_entry.get("named_h2h", {})
     named_tot = odds_entry.get("named_totals", {})
+    named_btts = odds_entry.get("named_btts", {})
     all_h2h = odds_entry.get("h2h", {})
     all_tot = odds_entry.get("all_totals", {})
+    all_btts = odds_entry.get("btts", {})
     book = odds_entry.get("book")
+
     if b in ("HOME WIN", "AWAY WIN", "DRAW"):
         key = home if b == "HOME WIN" else (away if b == "AWAY WIN" else "Draw")
-        if key in named_h2h: return named_h2h[key], book or "named"
-        if key in all_h2h: return all_h2h[key], "market-best"
+        if key in named_h2h:
+            return named_h2h[key], book or "named"
+        if key in all_h2h:
+            return all_h2h[key], "market-best"
         return None, "none"
+
+    if b in ("BTTS YES", "BTTS NO"):
+        side = "Yes" if b == "BTTS YES" else "No"
+        if side in named_btts:
+            return named_btts[side], book or "named"
+        if side in all_btts:
+            return all_btts[side], "market-best"
+        return None, "none"
+
     if b.startswith("OVER ") or b.startswith("UNDER "):
         try:
             line = float(b.split()[1])
@@ -587,6 +652,21 @@ def odds_for_bet(odds_entry, bet, home, away):
         if line in all_tot and side in all_tot[line]:
             return all_tot[line][side], "market-best"
         return None, "none"
+
+    # Double chance — approximate from 1X2 when no dedicated market
+    if b.startswith("DOUBLE CHANCE"):
+        if "1X" in b and home in all_h2h and "Draw" in all_h2h:
+            # rough combined price (not exact book price)
+            p = (1.0 / all_h2h[home]) + (1.0 / all_h2h["Draw"])
+            return round(1.0 / p, 3) if p > 0 else None, "approx-1x2"
+        if "X2" in b and away in all_h2h and "Draw" in all_h2h:
+            p = (1.0 / all_h2h[away]) + (1.0 / all_h2h["Draw"])
+            return round(1.0 / p, 3) if p > 0 else None, "approx-1x2"
+        if b.endswith("12") and home in all_h2h and away in all_h2h:
+            p = (1.0 / all_h2h[home]) + (1.0 / all_h2h[away])
+            return round(1.0 / p, 3) if p > 0 else None, "approx-1x2"
+        return None, "none"
+
     return None, "none"
 
 def passes_odds_filter(price, source):
