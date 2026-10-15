@@ -265,6 +265,7 @@ NUMBER_COLUMNS = {
     "league_base_total", "profit", "rank", "bets", "won", "lost",
     "n_home", "n_away", "hg", "ag", "fixtures_n", "results_n",
     "score", "adj", "penalty", "stake", "bankroll", "model_implied_odds",
+    "avg_odds",
 }
 
 
@@ -1189,6 +1190,29 @@ def archive_old_pending(history, days=ARCHIVE_PENDING_DAYS):
         out = out[~mask].reset_index(drop=True)
     return out
 
+def _odds_bracket(odds_val) -> str:
+    """Bucket decimal odds for accuracy tracking."""
+    try:
+        o = float(odds_val)
+    except (TypeError, ValueError):
+        return "unknown / missing"
+    if o != o or o <= 1.0:  # NaN or invalid
+        return "unknown / missing"
+    if o < 1.50:
+        return "1.01 – 1.49 (heavy fav)"
+    if o < 1.80:
+        return "1.50 – 1.79 (fav)"
+    if o < 2.20:
+        return "1.80 – 2.19 (near even)"
+    if o < 2.80:
+        return "2.20 – 2.79 (mild dog)"
+    if o < 3.50:
+        return "2.80 – 3.49 (dog)"
+    if o < 5.00:
+        return "3.50 – 4.99 (longshot)"
+    return "5.00+ (very long)"
+
+
 def build_accuracy(history):
     if history is None or history.empty:
         return pd.DataFrame()
@@ -1197,29 +1221,60 @@ def build_accuracy(history):
     settled = h[h["result"].isin(["WON", "LOST"])].copy()
     if settled.empty:
         return pd.DataFrame([{"grouping": "(nothing settled yet)", "value": "", "bets": 0,
-                              "won": 0, "lost": 0, "hit_rate": "", "avg_prob": "", "roi_per_bet": "", "note": ""}])
+                              "won": 0, "lost": 0, "hit_rate": "", "avg_prob": "",
+                              "avg_odds": "", "roi_per_bet": "", "note": ""}])
     settled["won_flag"] = (settled["result"] == "WON").astype(int)
     settled["prob_num"] = settled["prob"].map(lambda x: parse_rate(x))
     settled["profit_num"] = pd.to_numeric(settled["profit"], errors="coerce")
+    settled["odds_num"] = pd.to_numeric(settled.get("odds"), errors="coerce")
+    settled["odds_bracket"] = settled["odds_num"].map(_odds_bracket)
     rows = []
     def _summ(grouping, value, sub):
         n = len(sub)
         won = int(sub["won_flag"].sum())
         roi = sub["profit_num"].mean() if sub["profit_num"].notna().any() else None
+        avg_odds = sub["odds_num"].mean() if sub["odds_num"].notna().any() else None
         note = "LOW SAMPLE" if n < SAMPLE_SIZE_WARNING else ""
-        rows.append({"grouping": grouping, "value": value, "bets": n, "won": won, "lost": n - won,
-                     "hit_rate": f"{round(won / n * 100)}%" if n else "",
-                     "avg_prob": round(sub["prob_num"].mean(), 3) if sub["prob_num"].notna().any() else "",
-                     "roi_per_bet": round(roi, 3) if roi is not None else "", "note": note})
+        rows.append({
+            "grouping": grouping, "value": value, "bets": n, "won": won, "lost": n - won,
+            "hit_rate": f"{round(won / n * 100)}%" if n else "",
+            "avg_prob": round(sub["prob_num"].mean(), 3) if sub["prob_num"].notna().any() else "",
+            "avg_odds": round(avg_odds, 2) if avg_odds is not None and avg_odds == avg_odds else "",
+            "roi_per_bet": round(roi, 3) if roi is not None else "", "note": note,
+        })
     _summ("OVERALL", "all bets", settled)
     for bet, sub in settled.groupby("bet"):
         _summ("by bet type", str(bet), sub)
     for src, sub in settled.groupby("source"):
         _summ("by source tab", str(src), sub)
+    # Odds brackets — ordered from shortest to longest price
+    bracket_order = [
+        "1.01 – 1.49 (heavy fav)",
+        "1.50 – 1.79 (fav)",
+        "1.80 – 2.19 (near even)",
+        "2.20 – 2.79 (mild dog)",
+        "2.80 – 3.49 (dog)",
+        "3.50 – 4.99 (longshot)",
+        "5.00+ (very long)",
+        "unknown / missing",
+    ]
+    present = settled["odds_bracket"].value_counts()
+    for br in bracket_order:
+        if br in present.index:
+            _summ("by odds bracket", br, settled[settled["odds_bracket"] == br])
     df = pd.DataFrame(rows)
-    order = {"OVERALL": 0, "by bet type": 1, "by source tab": 2}
+    order = {"OVERALL": 0, "by bet type": 1, "by source tab": 2, "by odds bracket": 3}
     df["_o"] = df["grouping"].map(order).fillna(9)
-    return df.sort_values(["_o", "bets"], ascending=[True, False]).drop(columns=["_o"]).reset_index(drop=True)
+    # Keep odds brackets in price order; others by sample size
+    def _sort_key(row):
+        if row["grouping"] == "by odds bracket":
+            try:
+                return (order.get(row["grouping"], 9), bracket_order.index(row["value"]))
+            except ValueError:
+                return (order.get(row["grouping"], 9), 99)
+        return (order.get(row["grouping"], 9), -int(row["bets"]))
+    df["_s"] = df.apply(_sort_key, axis=1)
+    return df.sort_values("_s").drop(columns=["_o", "_s"]).reset_index(drop=True)
 
 
 # ================= MAIN =================
@@ -1359,6 +1414,7 @@ def main():
     # ---------- Top10 tabs ----------
     for col, label, tab in top10_specs:
         soft = top_n_for_market(probs_df, col, label, TOP_N)
+        soft = attach_odds(soft, odds_map, bankroll, apply_filter=False)
         final = ensure_at_least_one(soft, soft, size=3)
         write_df(tab, sort_by_date(final))
 
@@ -1404,8 +1460,8 @@ def main():
 
     # ---------- Combo_Bets ----------
     log("Combo_Bets...")
-    soft_combos = build_combo_bets(probs_df, top_k=40)
-    strict_combos = build_combo_bets(probs_df, top_k=COMBO_TOP_N)
+    soft_combos = attach_odds(build_combo_bets(probs_df, top_k=40), odds_map, bankroll, apply_filter=False)
+    strict_combos = attach_odds(build_combo_bets(probs_df, top_k=COMBO_TOP_N), odds_map, bankroll, apply_filter=False)
     combos_df = _dedupe_matches(ensure_at_least_one(strict_combos, soft_combos))
     write_df(TAB_COMBOS, sort_by_date(combos_df))
 
