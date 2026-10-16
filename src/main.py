@@ -763,9 +763,8 @@ def odds_for_bet(odds_entry, bet, home, away):
         return None, "none"
 
     # Double chance — approximate from 1X2 when no dedicated market
-    if b.startswith("DOUBLE CHANCE"):
+    if b.startswith("DOUBLE CHANCE") and "&" not in b:
         if "1X" in b and home in all_h2h and "Draw" in all_h2h:
-            # rough combined price (not exact book price)
             p = (1.0 / all_h2h[home]) + (1.0 / all_h2h["Draw"])
             return round(1.0 / p, 3) if p > 0 else None, "approx-1x2"
         if "X2" in b and away in all_h2h and "Draw" in all_h2h:
@@ -775,6 +774,29 @@ def odds_for_bet(odds_entry, bet, home, away):
             p = (1.0 / all_h2h[home]) + (1.0 / all_h2h[away])
             return round(1.0 / p, 3) if p > 0 else None, "approx-1x2"
         return None, "none"
+
+    # Combined bets (e.g. "HOME WIN & OVER 1.5"): multiply single-leg prices.
+    # Not a true book accumulator price (correlation / bet-builder margin differ),
+    # but far better than blank / pure model-implied for tracking.
+    if "&" in b:
+        legs = [x.strip() for x in bet.split("&") if x.strip()]
+        if len(legs) >= 2:
+            prices, sources = [], []
+            for leg in legs:
+                lp, ls = odds_for_bet(odds_entry, leg, home, away)
+                if lp is None or float(lp) <= 1.0:
+                    return None, "none"
+                prices.append(float(lp))
+                sources.append(ls)
+            # Mild correlation haircut so we do not overstate price on related legs
+            raw = 1.0
+            for p in prices:
+                raw *= p
+            combined = round(raw * 0.97, 3)  # ~3% builder-style haircut
+            src = "combo-approx"
+            if all(s not in ("none", "model-implied", None) for s in sources):
+                src = "combo-from-legs"
+            return combined, src
 
     return None, "none"
 
@@ -1291,19 +1313,52 @@ HISTORY_COLS = [
 ]
 
 def _hist_key(row):
+    """Full key including source — allows same match in multiple tabs if desired."""
     return (str(row.get("utcDate", ""))[:10], str(row.get("home", "")),
             str(row.get("away", "")), str(row.get("bet", "")), str(row.get("source", "")))
 
+
+def _match_bet_key(row):
+    """Match + market only (no source) — used to avoid duplicate tracking rows."""
+    return (str(row.get("utcDate", ""))[:10], str(row.get("home", "")),
+            str(row.get("away", "")), str(row.get("bet", "")).upper())
+
+
+# Tabs that are allowed to create a *new* history row even if another tab
+# already logged the same match+bet. Primary recommendation tabs only.
+_PRIMARY_HISTORY_SOURCES = {
+    "Best_Bets", "Safe_Picks", "Balanced_Picks", "Combo_Bets",
+}
+
+
 def append_new_picks(history, picks, source):
+    """Append picks to Bet_History.
+
+    Primary sources (Best/Safe/Balanced/Combo) always log if that source has not
+    logged the same match+bet yet.
+    Secondary sources (Top10_*) only log when *no* source has logged that match+bet,
+    so Accuracy is not flooded with duplicates.
+    """
     if picks is None or picks.empty:
         return history
-    existing = {_hist_key(h) for _, h in history.iterrows()} if not history.empty else set()
+    existing_full = set()
+    existing_match_bet = set()
+    if history is not None and not history.empty:
+        for _, h in history.iterrows():
+            existing_full.add(_hist_key(h))
+            existing_match_bet.add(_match_bet_key(h))
+
     new_rows = []
     stamp = now().strftime("%Y-%m-%d %H:%M:%S UTC")
+    primary = source in _PRIMARY_HISTORY_SOURCES
     for _, p in picks.iterrows():
-        cand = {"utcDate": p.get("utcDate", ""), "home": p.get("home", ""),
-                "away": p.get("away", ""), "bet": p.get("bet", ""), "source": source}
-        if _hist_key(cand) in existing:
+        full = (str(p.get("utcDate", ""))[:10], str(p.get("home", "")),
+                str(p.get("away", "")), str(p.get("bet", "")), str(source))
+        mb = (str(p.get("utcDate", ""))[:10], str(p.get("home", "")),
+              str(p.get("away", "")), str(p.get("bet", "")).upper())
+        if full in existing_full:
+            continue
+        if not primary and mb in existing_match_bet:
             continue
         new_rows.append({
             "logged_utc": stamp, "utcDate": p.get("utcDate", ""), "league": p.get("league", ""),
@@ -1312,13 +1367,15 @@ def append_new_picks(history, picks, source):
             "fractional": p.get("fractional", ""), "odds_source": p.get("odds_source", ""),
             "stake": p.get("stake", ""), "edge": p.get("edge", ""),
             "closing_odds": p.get("closing_odds", ""), "result": "PENDING",
-            "score": "", "profit": "",
+            "score": "", "profit": "", "profit_money": "", "clv": "",
         })
+        existing_full.add(full)
+        existing_match_bet.add(mb)
     if not new_rows:
         return history
     log(f"  logging {len(new_rows)} new pick(s) from {source}")
     add = pd.DataFrame(new_rows)
-    return add if history.empty else pd.concat([history, add], ignore_index=True)
+    return add if history is None or history.empty else pd.concat([history, add], ignore_index=True)
 
 def settle_history(history, rs_df):
     if history is None or history.empty or rs_df is None or rs_df.empty:
@@ -1454,7 +1511,9 @@ def _odds_bracket(odds_val) -> str:
 def build_accuracy(history):
     """Settled-bet performance by overall / bet / source / league / odds bracket / odds source.
 
-    Includes unit ROI and stake-weighted ROI when stake/profit_money are available.
+    OVERALL and time-window rows de-dupe the same match+bet logged from multiple tabs
+    (Best/Safe/Balanced/Top10) so hit rate is not inflated.
+    Includes unit ROI, stake-weighted ROI, and avg CLV when available.
     """
     if history is None or history.empty:
         return pd.DataFrame()
@@ -1468,18 +1527,43 @@ def build_accuracy(history):
             "avg_odds": "", "break_even": "", "roi_per_bet": "",
             "roi_stake_wtd": "", "avg_clv": "", "note": "",
         }])
-    settled["won_flag"] = (settled["result"] == "WON").astype(int)
-    settled["prob_num"] = settled["prob"].map(lambda x: parse_rate(x))
-    settled["profit_num"] = pd.to_numeric(settled.get("profit"), errors="coerce")
-    settled["profit_money_num"] = pd.to_numeric(settled.get("profit_money"), errors="coerce")
-    settled["stake_num"] = pd.to_numeric(settled.get("stake"), errors="coerce")
-    settled["odds_num"] = pd.to_numeric(settled.get("odds"), errors="coerce")
-    settled["clv_num"] = pd.to_numeric(settled.get("clv"), errors="coerce")
-    settled["odds_bracket"] = settled["odds_num"].map(_odds_bracket)
-    if "odds_source" not in settled.columns:
-        settled["odds_source"] = ""
-    if "league" not in settled.columns:
-        settled["league"] = ""
+
+    # Prefer primary tabs when the same match+market was logged more than once
+    _src_rank = {
+        "Best_Bets": 0, "Safe_Picks": 1, "Balanced_Picks": 2,
+        "Todays_Shortlist": 3, "Combo_Bets": 4,
+        "Top10_Over_1_5": 5, "Top10_Over_2_5": 6,
+    }
+    settled["_src_rank"] = settled.get("source", pd.Series([""] * len(settled))).map(
+        lambda s: _src_rank.get(str(s), 9)
+    )
+    settled["_match_bet"] = (
+        settled["utcDate"].astype(str).str[:10] + "|" +
+        settled["home"].astype(str) + "|" +
+        settled["away"].astype(str) + "|" +
+        settled["bet"].astype(str).str.upper()
+    )
+    settled = settled.sort_values("_src_rank")
+    settled_dedup = settled.drop_duplicates(subset=["_match_bet"], keep="first").copy()
+
+    def _prep(df):
+        out = df.copy()
+        out["won_flag"] = (out["result"] == "WON").astype(int)
+        out["prob_num"] = out["prob"].map(lambda x: parse_rate(x))
+        out["profit_num"] = pd.to_numeric(out.get("profit"), errors="coerce")
+        out["profit_money_num"] = pd.to_numeric(out.get("profit_money"), errors="coerce")
+        out["stake_num"] = pd.to_numeric(out.get("stake"), errors="coerce")
+        out["odds_num"] = pd.to_numeric(out.get("odds"), errors="coerce")
+        out["clv_num"] = pd.to_numeric(out.get("clv"), errors="coerce")
+        out["odds_bracket"] = out["odds_num"].map(_odds_bracket)
+        if "odds_source" not in out.columns:
+            out["odds_source"] = ""
+        if "league" not in out.columns:
+            out["league"] = ""
+        return out
+
+    settled = _prep(settled)
+    settled_dedup = _prep(settled_dedup)
     rows = []
 
     def _summ(grouping, value, sub):
@@ -1489,7 +1573,6 @@ def build_accuracy(history):
         avg_odds = sub["odds_num"].mean() if sub["odds_num"].notna().any() else None
         be = (1.0 / avg_odds) if avg_odds and avg_odds > 1 else None
         hit = (won / n) if n else None
-        # Stake-weighted ROI = total money P&L / total stakes
         stakes = sub["stake_num"]
         money = sub["profit_money_num"]
         if money.notna().any() and stakes.notna().any() and stakes.fillna(0).sum() > 0:
@@ -1515,15 +1598,22 @@ def build_accuracy(history):
             "note": note,
         })
 
-    _summ("OVERALL", "all bets", settled)
-    for bet, sub in settled.groupby("bet"):
-        _summ("by bet type", str(bet), sub)
+    # De-duped headline figures
+    _summ("OVERALL", "all bets (de-duped)", settled_dedup)
+    recent_cut = (now() - timedelta(days=30)).strftime("%Y-%m-%d")
+    recent = settled_dedup[settled_dedup["utcDate"].astype(str).str[:10] >= recent_cut]
+    if not recent.empty:
+        _summ("OVERALL", "last 30 days (de-duped)", recent)
+
+    # By source keeps every logged row (you want tab-level truth)
     for src, sub in settled.groupby("source"):
         _summ("by source tab", str(src), sub)
-    for lg, sub in settled.groupby("league"):
+    for bet, sub in settled_dedup.groupby("bet"):
+        _summ("by bet type", str(bet), sub)
+    for lg, sub in settled_dedup.groupby("league"):
         if str(lg).strip():
             _summ("by league", str(lg), sub)
-    for osrc, sub in settled.groupby("odds_source"):
+    for osrc, sub in settled_dedup.groupby("odds_source"):
         label = str(osrc).strip() or "unknown"
         _summ("by odds source", label, sub)
 
@@ -1537,10 +1627,10 @@ def build_accuracy(history):
         "5.00+ (very long)",
         "unknown / missing",
     ]
-    present = settled["odds_bracket"].value_counts()
+    present = settled_dedup["odds_bracket"].value_counts()
     for br in bracket_order:
         if br in present.index:
-            _summ("by odds bracket", br, settled[settled["odds_bracket"] == br])
+            _summ("by odds bracket", br, settled_dedup[settled_dedup["odds_bracket"] == br])
 
     df = pd.DataFrame(rows)
     order = {
@@ -1560,6 +1650,9 @@ def build_accuracy(history):
                 return (base, bracket_order.index(row["value"]))
             except ValueError:
                 return (base, 99)
+        if g == "OVERALL":
+            # all bets first, then last 30 days
+            return (base, 0 if "all bets" in str(row["value"]) else 1)
         return (base, -int(row["bets"]))
 
     df["_s"] = df.apply(_sort_key, axis=1)
