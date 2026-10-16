@@ -60,6 +60,12 @@ MIN_EDGE = 0.04
 PERF_MIN_WIN_RATE = 0.52
 PERF_MIN_BETS = 8
 OVER_15_MIN_TOTAL_XG = 2.55
+# Odds-bracket filter: drop brackets with poor historical ROI once sample is large enough
+BRACKET_MIN_BETS = 20
+BRACKET_MIN_ROI = -0.08          # unit ROI floor (e.g. -0.08 = -8% per bet)
+BRACKET_FILTER_ENABLED = True
+# Auto-update Config!B2 bankroll from settled stake-weighted P&L
+AUTO_UPDATE_BANKROLL = True
 
 DEFAULT_BANKROLL = 1000.0
 KELLY_FRACTION = 0.25
@@ -265,7 +271,7 @@ NUMBER_COLUMNS = {
     "league_base_total", "profit", "rank", "bets", "won", "lost",
     "n_home", "n_away", "hg", "ag", "fixtures_n", "results_n",
     "score", "adj", "penalty", "stake", "bankroll", "model_implied_odds",
-    "avg_odds",
+    "avg_odds", "profit_money", "clv", "roi_stake_wtd",
 }
 
 
@@ -418,6 +424,85 @@ def get_bankroll() -> float:
         return float(val) if val else DEFAULT_BANKROLL
     except Exception:
         return DEFAULT_BANKROLL
+
+
+def set_bankroll(value: float) -> None:
+    """Write current bankroll to Config!B2 (creates Config sheet if needed)."""
+    try:
+        sh = open_sheet()
+        ws = _get_or_create_ws(sh, TAB_CONFIG, rows=20, cols=6)
+        # Ensure labels exist
+        existing = ws.get_all_values()
+        if not existing or not existing[0]:
+            ws.update("A1:B2", [["setting", "value"], ["bankroll", value]])
+        else:
+            ws.update("A2:B2", [["bankroll", value]])
+        log(f"  bankroll updated on Config!B2 → {value:.2f}")
+    except Exception as e:
+        log(f"  bankroll write failed: {e}")
+
+
+def apply_settled_to_bankroll(history, bankroll: float) -> float:
+    """Add newly settled stake-weighted P&L into bankroll and persist.
+
+    Uses profit_money when present; falls back to unit profit if stake was blank.
+    Only rows with result WON/LOST and a numeric profit contribute.
+    Tracks applied rows via a marker column `_bankroll_applied` stored in-sheet as blank/1
+    is awkward — instead we only auto-adjust once per run using profits that look
+    unsettled in money terms is fragile. Simpler approach: recompute bankroll as
+    DEFAULT/starting + sum(all profit_money). That needs a starting bankroll cell.
+
+    Practical approach used here:
+      - Read Config!B3 as starting_bankroll (optional). If missing, use current B2 as baseline
+        only when no settled profit_money exists yet.
+      - New bankroll = starting + sum(profit_money of all settled bets with stake).
+    """
+    if not AUTO_UPDATE_BANKROLL:
+        return bankroll
+    if history is None or history.empty:
+        return bankroll
+    h = history.copy()
+    settled = h[h["result"].astype(str).str.upper().isin(["WON", "LOST"])]
+    if settled.empty:
+        return bankroll
+    money = pd.to_numeric(settled.get("profit_money"), errors="coerce")
+    if money.notna().sum() == 0:
+        # Fall back to unit profits (assume 1-unit stakes)
+        money = pd.to_numeric(settled.get("profit"), errors="coerce")
+    total_pnl = float(money.fillna(0).sum())
+
+    # Starting bankroll: Config!B3 if set, else (current - total_pnl) to avoid double-count
+    starting = None
+    try:
+        sh = open_sheet()
+        ws = sh.worksheet(TAB_CONFIG)
+        vals = ws.get_all_values()
+        # Expect rows: [setting,value], [bankroll,X], [starting_bankroll,Y]
+        for row in vals:
+            if len(row) >= 2 and str(row[0]).strip().lower() in ("starting_bankroll", "starting", "start"):
+                starting = float(row[1])
+                break
+    except Exception:
+        starting = None
+
+    if starting is None:
+        # Derive: treat current bankroll as already including past P&L only if we can't find start
+        # Safer: set starting = bankroll - total_pnl so new = bankroll (no jump), then next
+        # settles move it. On first enable this keeps bankroll stable.
+        starting = bankroll - total_pnl
+        try:
+            sh = open_sheet()
+            ws = _get_or_create_ws(sh, TAB_CONFIG, rows=20, cols=6)
+            ws.update("A3:B3", [["starting_bankroll", round(starting, 2)]])
+        except Exception as e:
+            log(f"  starting_bankroll seed failed: {e}")
+
+    new_bankroll = round(starting + total_pnl, 2)
+    if abs(new_bankroll - bankroll) >= 0.01:
+        set_bankroll(new_bankroll)
+        log(f"  bankroll {bankroll:.2f} → {new_bankroll:.2f} (P&L {total_pnl:+.2f})")
+        return new_bankroll
+    return bankroll
 
 
 # ================= FOOTBALL-DATA =================
@@ -700,10 +785,13 @@ def passes_odds_filter(price, source):
     return MIN_DECIMAL_ODDS <= p <= MAX_DECIMAL_ODDS
 
 def attach_odds(df, odds_map, bankroll, apply_filter=True):
-    """Attach real bookmaker prices; fall back to model-implied so odds never blank."""
+    """Attach real bookmaker prices; fall back to model-implied so odds never blank.
+
+    Also computes market edge = model_prob - 1/odds (positive = value vs the price).
+    """
     if df is None or df.empty:
         return df
-    prices, fracs, sources, keeps, stakes = [], [], [], [], []
+    prices, fracs, sources, keeps, stakes, edges = [], [], [], [], [], []
     for _, r in df.iterrows():
         entry = odds_map.get((r.get("league"), r.get("home"), r.get("away")))
         price, source = odds_for_bet(entry, str(r.get("bet", "")), r.get("home"), r.get("away"))
@@ -717,15 +805,25 @@ def attach_odds(df, odds_map, bankroll, apply_filter=True):
         sources.append(source or "none")
         keeps.append(passes_odds_filter(price, source))
         stakes.append(kelly_stake(r.get("prob"), price, bankroll) if price else "")
+        edge_val = ""
+        try:
+            p = float(r.get("prob"))
+            o = float(price) if price else None
+            if o and o > 1.0 and 0.0 < p < 1.0:
+                edge_val = round(p - (1.0 / o), 4)
+        except (TypeError, ValueError):
+            edge_val = ""
+        edges.append(edge_val)
     out = df.copy()
     out["odds"] = prices
     out["fractional"] = fracs
     out["odds_source"] = sources
     out["stake"] = stakes
-    out["closing_odds"] = ""
+    out["edge"] = edges
+    if "closing_odds" not in out.columns:
+        out["closing_odds"] = ""
     if apply_filter:
         before = len(out)
-        # Never drop picks solely because odds are model-implied
         out = out[pd.Series(keeps, index=out.index)].reset_index(drop=True)
         if before - len(out):
             log(f"  odds filter removed {before - len(out)} pick(s)")
@@ -735,6 +833,60 @@ def attach_odds(df, odds_map, bankroll, apply_filter=True):
     n_model = sum(1 for s in sources if s == "model-implied")
     log(f"  odds attached: {n_real} bookmaker, {n_model} model-implied, {len(prices)} total")
     return out
+
+def calculate_odds_bracket_roi(history: pd.DataFrame, min_bets: int = BRACKET_MIN_BETS) -> Dict[str, float]:
+    """Return {odds_bracket: unit_roi} for brackets with enough settled bets."""
+    if history is None or history.empty:
+        return {}
+    h = history.copy()
+    h["result"] = h["result"].astype(str).str.upper()
+    settled = h[h["result"].isin(["WON", "LOST"])]
+    if settled.empty or "odds" not in settled.columns:
+        return {}
+    settled = settled.copy()
+    settled["odds_num"] = pd.to_numeric(settled["odds"], errors="coerce")
+    settled["profit_num"] = pd.to_numeric(settled.get("profit"), errors="coerce")
+    settled["bracket"] = settled["odds_num"].map(_odds_bracket)
+    out: Dict[str, float] = {}
+    for br, sub in settled.groupby("bracket"):
+        if br == "unknown / missing" or len(sub) < min_bets:
+            continue
+        roi = sub["profit_num"].mean()
+        if roi == roi:
+            out[str(br)] = float(roi)
+    return out
+
+
+def apply_odds_bracket_filter(
+    picks: pd.DataFrame,
+    history: pd.DataFrame,
+    min_bets: int = BRACKET_MIN_BETS,
+    min_roi: float = BRACKET_MIN_ROI,
+) -> pd.DataFrame:
+    """Drop picks whose decimal odds fall in historically losing brackets."""
+    if not BRACKET_FILTER_ENABLED:
+        return picks
+    if picks is None or picks.empty or "odds" not in picks.columns:
+        return picks
+    bracket_roi = calculate_odds_bracket_roi(history, min_bets=min_bets)
+    if not bracket_roi:
+        return picks
+    bad = {br for br, roi in bracket_roi.items() if roi < min_roi}
+    if not bad:
+        return picks
+
+    out = picks.copy()
+    odds_num = pd.to_numeric(out["odds"], errors="coerce")
+    brackets = odds_num.map(_odds_bracket)
+    keep = ~brackets.isin(bad)
+    removed = int((~keep).sum())
+    if removed:
+        log(f"  odds-bracket filter removed {removed} pick(s) in {sorted(bad)}")
+        out = out[keep].copy()
+        if "rank" in out.columns and not out.empty:
+            out["rank"] = range(1, len(out) + 1)
+    return out.reset_index(drop=True)
+
 
 def apply_value_filter(df, min_edge=MIN_EDGE):
     if df is None or df.empty or "odds" not in df.columns or "prob" not in df.columns:
@@ -1081,7 +1233,7 @@ def build_shortlist(best_df, safe_df, bal_df, size=SHORTLIST_SIZE):
     mix = _dedupe_matches(mix, limit=size)
 
     keep = ["rank", "utcDate", "league", "home", "away", "bet", "prob", "odds", "fractional",
-            "stake", "confidence", "score", "source", "odds_source", "warning"]
+            "stake", "edge", "confidence", "score", "source", "odds_source", "warning"]
     return mix[[c for c in keep if c in mix.columns]]
 
 def build_dashboard(shortlist, history, bankroll):
@@ -1093,21 +1245,49 @@ def build_dashboard(shortlist, history, bankroll):
         total_stake = pd.to_numeric(shortlist["stake"], errors="coerce").sum()
         rows.append({"metric": "Total recommended stake", "value": f"{total_stake:.2f}"})
         rows.append({"metric": "% of bankroll", "value": f"{(total_stake / bankroll * 100):.1f}%"})
+        if "edge" in shortlist.columns:
+            avg_edge = pd.to_numeric(shortlist["edge"], errors="coerce").mean()
+            if avg_edge == avg_edge:
+                rows.append({"metric": "Shortlist avg edge", "value": f"{avg_edge * 100:.1f}%"})
     if history is not None and not history.empty:
-        settled = history[history["result"].astype(str).str.upper().isin(["WON", "LOST"])]
+        res_u = history["result"].astype(str).str.upper()
+        pending = int((res_u == "PENDING").sum())
+        settled = history[res_u.isin(["WON", "LOST"])]
+        rows.append({"metric": "Pending bets", "value": pending})
         if not settled.empty:
-            wins = (settled["result"].astype(str).str.upper() == "WON").sum()
-            rows.append({"metric": "Historical hit rate", "value": f"{wins / len(settled) * 100:.0f}%"})
-            profit = pd.to_numeric(settled.get("profit"), errors="coerce").sum()
-            rows.append({"metric": "Historical profit (units)", "value": f"{profit:.2f}"})
+            wins = int((settled["result"].astype(str).str.upper() == "WON").sum())
+            n = len(settled)
+            rows.append({"metric": "Settled bets", "value": n})
+            rows.append({"metric": "Historical hit rate", "value": f"{wins / n * 100:.0f}%"})
+            profit = pd.to_numeric(settled.get("profit"), errors="coerce")
+            rows.append({"metric": "Historical profit (units)", "value": f"{profit.sum():.2f}"})
+            rows.append({"metric": "ROI per bet (units)", "value": f"{profit.mean():.3f}"})
+            money = pd.to_numeric(settled.get("profit_money"), errors="coerce")
+            stakes = pd.to_numeric(settled.get("stake"), errors="coerce")
+            if money.notna().any() and stakes.fillna(0).sum() > 0:
+                rows.append({"metric": "ROI stake-weighted", "value": f"{money.fillna(0).sum() / stakes.fillna(0).sum():.3f}"})
+            clv = pd.to_numeric(settled.get("clv"), errors="coerce")
+            if clv.notna().any():
+                rows.append({"metric": "Avg CLV (prob pts)", "value": f"{clv.mean():+.4f}"})
+            odds_num = pd.to_numeric(settled.get("odds"), errors="coerce")
+            brackets = odds_num.map(_odds_bracket)
+            best_br, best_roi = None, None
+            for br, idx in brackets.groupby(brackets).groups.items():
+                if br == "unknown / missing" or len(idx) < 5:
+                    continue
+                r = profit.loc[idx].mean()
+                if r == r and (best_roi is None or r > best_roi):
+                    best_br, best_roi = br, r
+            if best_br is not None:
+                rows.append({"metric": "Best odds bracket (ROI)", "value": f"{best_br} → {best_roi:+.3f}"})
     return pd.DataFrame(rows)
 
 
 # ================= HISTORY / ACCURACY =================
 HISTORY_COLS = [
     "logged_utc", "utcDate", "league", "home", "away", "bet", "source",
-    "prob", "odds", "fractional", "odds_source", "stake", "closing_odds",
-    "result", "score", "profit",
+    "prob", "odds", "fractional", "odds_source", "stake", "edge", "closing_odds",
+    "result", "score", "profit", "profit_money", "clv",
 ]
 
 def _hist_key(row):
@@ -1130,7 +1310,8 @@ def append_new_picks(history, picks, source):
             "home": p.get("home", ""), "away": p.get("away", ""), "bet": p.get("bet", ""),
             "source": source, "prob": p.get("prob", ""), "odds": p.get("odds", ""),
             "fractional": p.get("fractional", ""), "odds_source": p.get("odds_source", ""),
-            "stake": p.get("stake", ""), "closing_odds": "", "result": "PENDING",
+            "stake": p.get("stake", ""), "edge": p.get("edge", ""),
+            "closing_odds": p.get("closing_odds", ""), "result": "PENDING",
             "score": "", "profit": "",
         })
     if not new_rows:
@@ -1151,7 +1332,7 @@ def settle_history(history, rs_df):
             continue
     settled = 0
     out = history.copy()
-    for col in ("result", "score", "profit"):
+    for col in ("result", "score", "profit", "profit_money", "clv"):
         if col not in out.columns:
             out[col] = ""
         out[col] = out[col].astype(object)
@@ -1171,11 +1352,68 @@ def settle_history(history, rs_df):
             odds = float(h.get("odds") or 0)
         except Exception:
             odds = 0.0
-        out.at[i, "profit"] = round(odds - 1, 3) if won and odds > 1 else (-1.0 if odds > 1 else "")
+        try:
+            stake = float(h.get("stake") or 0)
+        except Exception:
+            stake = 0.0
+        # Unit profit (1-unit stake) and money profit (Kelly stake)
+        if odds > 1:
+            unit = round(odds - 1, 3) if won else -1.0
+            out.at[i, "profit"] = unit
+            out.at[i, "profit_money"] = round(stake * unit, 2) if stake > 0 else ""
+        else:
+            out.at[i, "profit"] = ""
+            out.at[i, "profit_money"] = ""
+        # Closing-line value: positive CLV means you beat the close (higher entry price)
+        try:
+            closing = float(h.get("closing_odds") or 0)
+        except Exception:
+            closing = 0.0
+        if odds > 1 and closing > 1:
+            # CLV in probability points: implied_close - implied_entry
+            out.at[i, "clv"] = round((1.0 / closing) - (1.0 / odds), 4)
+        else:
+            out.at[i, "clv"] = ""
         settled += 1
     if settled:
         log(f"  settled {settled} bet(s)")
     return out
+
+def refresh_closing_odds(history, odds_map):
+    """For still-PENDING bets, refresh closing_odds from the latest odds snapshot.
+
+    Practical CLV proxy: entry odds (logged) vs latest pre-kick price.
+    Finished matches drop out of odds_map and are left unchanged.
+    """
+    if history is None or history.empty or not odds_map:
+        return history
+    out = history.copy()
+    if "closing_odds" not in out.columns:
+        out["closing_odds"] = ""
+    out["closing_odds"] = out["closing_odds"].astype(object)
+    updated = 0
+    for i, h in out.iterrows():
+        if str(h.get("result", "")).upper() not in ("", "PENDING"):
+            continue
+        key = (h.get("league"), h.get("home"), h.get("away"))
+        entry = odds_map.get(key)
+        if not entry:
+            continue
+        price, _src = odds_for_bet(entry, str(h.get("bet", "")), h.get("home"), h.get("away"))
+        if price is None:
+            continue
+        try:
+            price = round(float(price), 3)
+        except (TypeError, ValueError):
+            continue
+        if str(h.get("closing_odds", "")).strip() == str(price):
+            continue
+        out.at[i, "closing_odds"] = price
+        updated += 1
+    if updated:
+        log(f"  refreshed closing odds on {updated} pending bet(s)")
+    return out
+
 
 def archive_old_pending(history, days=ARCHIVE_PENDING_DAYS):
     if history is None or history.empty:
@@ -1214,40 +1452,81 @@ def _odds_bracket(odds_val) -> str:
 
 
 def build_accuracy(history):
+    """Settled-bet performance by overall / bet / source / league / odds bracket / odds source.
+
+    Includes unit ROI and stake-weighted ROI when stake/profit_money are available.
+    """
     if history is None or history.empty:
         return pd.DataFrame()
     h = history.copy()
     h["result"] = h["result"].astype(str).str.upper()
     settled = h[h["result"].isin(["WON", "LOST"])].copy()
     if settled.empty:
-        return pd.DataFrame([{"grouping": "(nothing settled yet)", "value": "", "bets": 0,
-                              "won": 0, "lost": 0, "hit_rate": "", "avg_prob": "",
-                              "avg_odds": "", "roi_per_bet": "", "note": ""}])
+        return pd.DataFrame([{
+            "grouping": "(nothing settled yet)", "value": "", "bets": 0,
+            "won": 0, "lost": 0, "hit_rate": "", "avg_prob": "",
+            "avg_odds": "", "break_even": "", "roi_per_bet": "",
+            "roi_stake_wtd": "", "avg_clv": "", "note": "",
+        }])
     settled["won_flag"] = (settled["result"] == "WON").astype(int)
     settled["prob_num"] = settled["prob"].map(lambda x: parse_rate(x))
-    settled["profit_num"] = pd.to_numeric(settled["profit"], errors="coerce")
+    settled["profit_num"] = pd.to_numeric(settled.get("profit"), errors="coerce")
+    settled["profit_money_num"] = pd.to_numeric(settled.get("profit_money"), errors="coerce")
+    settled["stake_num"] = pd.to_numeric(settled.get("stake"), errors="coerce")
     settled["odds_num"] = pd.to_numeric(settled.get("odds"), errors="coerce")
+    settled["clv_num"] = pd.to_numeric(settled.get("clv"), errors="coerce")
     settled["odds_bracket"] = settled["odds_num"].map(_odds_bracket)
+    if "odds_source" not in settled.columns:
+        settled["odds_source"] = ""
+    if "league" not in settled.columns:
+        settled["league"] = ""
     rows = []
+
     def _summ(grouping, value, sub):
         n = len(sub)
         won = int(sub["won_flag"].sum())
         roi = sub["profit_num"].mean() if sub["profit_num"].notna().any() else None
         avg_odds = sub["odds_num"].mean() if sub["odds_num"].notna().any() else None
+        be = (1.0 / avg_odds) if avg_odds and avg_odds > 1 else None
+        hit = (won / n) if n else None
+        # Stake-weighted ROI = total money P&L / total stakes
+        stakes = sub["stake_num"]
+        money = sub["profit_money_num"]
+        if money.notna().any() and stakes.notna().any() and stakes.fillna(0).sum() > 0:
+            roi_sw = float(money.fillna(0).sum() / stakes.fillna(0).sum())
+        else:
+            roi_sw = None
+        avg_clv = sub["clv_num"].mean() if sub["clv_num"].notna().any() else None
         note = "LOW SAMPLE" if n < SAMPLE_SIZE_WARNING else ""
+        if note == "" and hit is not None and be is not None:
+            if hit + 0.03 < be:
+                note = "BELOW BREAK-EVEN"
+            elif hit > be + 0.05:
+                note = "BEATING BREAK-EVEN"
         rows.append({
             "grouping": grouping, "value": value, "bets": n, "won": won, "lost": n - won,
             "hit_rate": f"{round(won / n * 100)}%" if n else "",
             "avg_prob": round(sub["prob_num"].mean(), 3) if sub["prob_num"].notna().any() else "",
             "avg_odds": round(avg_odds, 2) if avg_odds is not None and avg_odds == avg_odds else "",
-            "roi_per_bet": round(roi, 3) if roi is not None else "", "note": note,
+            "break_even": f"{round(be * 100)}%" if be is not None else "",
+            "roi_per_bet": round(roi, 3) if roi is not None else "",
+            "roi_stake_wtd": round(roi_sw, 3) if roi_sw is not None else "",
+            "avg_clv": round(avg_clv, 4) if avg_clv is not None and avg_clv == avg_clv else "",
+            "note": note,
         })
+
     _summ("OVERALL", "all bets", settled)
     for bet, sub in settled.groupby("bet"):
         _summ("by bet type", str(bet), sub)
     for src, sub in settled.groupby("source"):
         _summ("by source tab", str(src), sub)
-    # Odds brackets — ordered from shortest to longest price
+    for lg, sub in settled.groupby("league"):
+        if str(lg).strip():
+            _summ("by league", str(lg), sub)
+    for osrc, sub in settled.groupby("odds_source"):
+        label = str(osrc).strip() or "unknown"
+        _summ("by odds source", label, sub)
+
     bracket_order = [
         "1.01 – 1.49 (heavy fav)",
         "1.50 – 1.79 (fav)",
@@ -1262,19 +1541,30 @@ def build_accuracy(history):
     for br in bracket_order:
         if br in present.index:
             _summ("by odds bracket", br, settled[settled["odds_bracket"] == br])
+
     df = pd.DataFrame(rows)
-    order = {"OVERALL": 0, "by bet type": 1, "by source tab": 2, "by odds bracket": 3}
-    df["_o"] = df["grouping"].map(order).fillna(9)
-    # Keep odds brackets in price order; others by sample size
+    order = {
+        "OVERALL": 0,
+        "by bet type": 1,
+        "by source tab": 2,
+        "by league": 3,
+        "by odds source": 4,
+        "by odds bracket": 5,
+    }
+
     def _sort_key(row):
-        if row["grouping"] == "by odds bracket":
+        g = row["grouping"]
+        base = order.get(g, 9)
+        if g == "by odds bracket":
             try:
-                return (order.get(row["grouping"], 9), bracket_order.index(row["value"]))
+                return (base, bracket_order.index(row["value"]))
             except ValueError:
-                return (order.get(row["grouping"], 9), 99)
-        return (order.get(row["grouping"], 9), -int(row["bets"]))
+                return (base, 99)
+        return (base, -int(row["bets"]))
+
     df["_s"] = df.apply(_sort_key, axis=1)
-    return df.sort_values("_s").drop(columns=["_o", "_s"]).reset_index(drop=True)
+    return df.sort_values("_s").drop(columns=["_s"]).reset_index(drop=True)
+
 
 
 # ================= MAIN =================
@@ -1348,6 +1638,7 @@ def main():
     history = read_df(TAB_HISTORY)
     history = settle_history(history, rs_df)
     history = archive_old_pending(history)
+    bankroll = apply_settled_to_bankroll(history, bankroll)
 
     def _finish(reason):
         write_df(TAB_HISTORY, history if history is not None and not history.empty else pd.DataFrame())
@@ -1403,6 +1694,9 @@ def main():
     except Exception as e:
         log(f"odds integration skipped: {e}")
 
+    # Update closing_odds on still-PENDING history rows while prices are live
+    history = refresh_closing_odds(history, odds_map)
+
     for i, row in probs_df.iterrows():
         mkt = market_probs_for_fixture(odds_map.get((row["league"], row["home"], row["away"])), row["home"], row["away"])
         for col in ("p_home", "p_draw", "p_away"):
@@ -1412,11 +1706,13 @@ def main():
         probs_df.at[i, "p_12"] = probs_df.at[i, "p_home"] + probs_df.at[i, "p_away"]
 
     # ---------- Top10 tabs ----------
+    top10_frames = {}
     for col, label, tab in top10_specs:
         soft = top_n_for_market(probs_df, col, label, TOP_N)
         soft = attach_odds(soft, odds_map, bankroll, apply_filter=False)
         final = ensure_at_least_one(soft, soft, size=3)
         write_df(tab, sort_by_date(final))
+        top10_frames[tab] = final
 
     baselines = build_league_market_baselines(probs_df)
 
@@ -1427,6 +1723,7 @@ def main():
     strict_safe = apply_value_filter(strict_safe)
     strict_safe = apply_over15_quality_filter(strict_safe)
     strict_safe = apply_performance_filter(strict_safe, history)
+    strict_safe = apply_odds_bracket_filter(strict_safe, history)
     strict_safe = apply_league_weighting(strict_safe, history)
     safe_df = _dedupe_matches(ensure_at_least_one(strict_safe, soft_safe))
     write_df(TAB_SAFE, sort_by_date(safe_df))
@@ -1438,6 +1735,7 @@ def main():
     strict_bal = apply_value_filter(strict_bal)
     strict_bal = apply_over15_quality_filter(strict_bal)
     strict_bal = apply_performance_filter(strict_bal, history)
+    strict_bal = apply_odds_bracket_filter(strict_bal, history)
     strict_bal = apply_league_weighting(strict_bal, history)
     bal_df = _dedupe_matches(ensure_at_least_one(strict_bal, soft_bal))
     write_df(TAB_BAL, sort_by_date(bal_df))
@@ -1449,6 +1747,7 @@ def main():
     strict_best = apply_value_filter(strict_best)
     strict_best = apply_over15_quality_filter(strict_best)
     strict_best = apply_performance_filter(strict_best, history)
+    strict_best = apply_odds_bracket_filter(strict_best, history)
     strict_best = apply_league_weighting(strict_best, history)
     best_df = _dedupe_matches(ensure_at_least_one(strict_best, soft_best))
     write_df(TAB_BEST_BETS, sort_by_date(best_df))
@@ -1480,6 +1779,8 @@ def main():
     history = append_new_picks(history, safe_df, "Safe_Picks")
     history = append_new_picks(history, bal_df, "Balanced_Picks")
     history = append_new_picks(history, combos_df, "Combo_Bets")
+    for tab, frame in top10_frames.items():
+        history = append_new_picks(history, frame, tab)
     if history is not None and not history.empty:
         for c in HISTORY_COLS:
             if c not in history.columns:
