@@ -22,7 +22,7 @@ from odds_api import (
 from bet_tracking import combo_probs, COMBO_SPECS, evaluate_bet, decimal_to_fractional
 from performance import apply_performance_filter, apply_league_weighting
 from odds_sources import (
-    get_fd_odds_cache, merge_odds_entry, model_implied_odds,
+    get_fd_odds_cache, merge_odds_entry, model_implied_odds, attach_corner_avgs,
 )
 
 
@@ -272,6 +272,8 @@ NUMBER_COLUMNS = {
     "n_home", "n_away", "hg", "ag", "fixtures_n", "results_n",
     "score", "adj", "penalty", "stake", "bankroll", "model_implied_odds",
     "avg_odds", "profit_money", "clv", "roi_stake_wtd",
+    "home_corners_avg", "away_corners_avg",
+    "exp_home_corners", "exp_away_corners", "exp_total_corners", "league_avg_corners",
 }
 
 
@@ -1020,7 +1022,11 @@ def make_filtered_picks(probs_df, baselines, rules, max_rows=30, unique_teams=Tr
                           "bet": mkt, "prob": round(prob, 3), "league_avg": round(league_avg, 3),
                           "edge": round(edge, 3), "home_xg": round(home_xg, 2), "away_xg": round(away_xg, 2),
                           "confidence": round(conf, 3), "adj": round(adj, 3), "penalty": round(pen, 3),
-                          "score": round(sc, 4)})
+                          "score": round(sc, 4),
+                          "home_corners_avg": r.get("home_corners_avg", ""),
+                          "away_corners_avg": r.get("away_corners_avg", ""),
+                          "exp_total_corners": r.get("exp_total_corners", ""),
+                          "league_avg_corners": r.get("league_avg_corners", "")})
     df = pd.DataFrame(picks)
     if df.empty:
         return df
@@ -1110,7 +1116,10 @@ def _dedupe_teams(df, limit):
 def top_n_for_market(probs_df, prob_col, bet_label, top_n=TOP_N):
     if probs_df is None or probs_df.empty:
         return pd.DataFrame()
-    df = probs_df[CORE_COLS + ["confidence", "home_xg", "away_xg", "league_base_total", prob_col]].copy()
+    extra = [c for c in (
+        "home_corners_avg", "away_corners_avg", "exp_total_corners", "league_avg_corners"
+    ) if c in probs_df.columns]
+    df = probs_df[CORE_COLS + ["confidence", "home_xg", "away_xg", "league_base_total", prob_col] + extra].copy()
     df = df.rename(columns={prob_col: "prob"})
     df["bet"] = bet_label
     df["prob"] = pd.to_numeric(df["prob"], errors="coerce")
@@ -1125,7 +1134,8 @@ def top_n_for_market(probs_df, prob_col, bet_label, top_n=TOP_N):
     df = df.sort_values(["score", "prob"], ascending=[False, False]).reset_index(drop=True)
     df = _dedupe_teams(df, top_n) if UNIQUE_TEAMS_PER_TOP10 else df.head(top_n)
     df.insert(0, "rank", range(1, len(df) + 1))
-    return df[["rank", "utcDate", "league", "home", "away", "bet", "prob", "confidence", "score", "adj", "penalty"]]
+    keep = ["rank", "utcDate", "league", "home", "away", "bet", "prob", "confidence", "score", "adj", "penalty"] + extra
+    return df[[c for c in keep if c in df.columns]]
 
 def build_best_bets(probs_df):
     if probs_df.empty:
@@ -1143,7 +1153,11 @@ def build_best_bets(probs_df):
                 best_p, best_mkt = p, label
         rows.append({"utcDate": r["utcDate"], "league": r["league"], "home": r["home"], "away": r["away"],
                      "bet": best_mkt, "prob": round(best_p, 3), "confidence": r["confidence"],
-                     "home_xg": r.get("home_xg"), "away_xg": r.get("away_xg")})
+                     "home_xg": r.get("home_xg"), "away_xg": r.get("away_xg"),
+                     "home_corners_avg": r.get("home_corners_avg", ""),
+                     "away_corners_avg": r.get("away_corners_avg", ""),
+                     "exp_total_corners": r.get("exp_total_corners", ""),
+                     "league_avg_corners": r.get("league_avg_corners", "")})
     df = pd.DataFrame(rows).sort_values(["prob", "confidence"], ascending=[False, False]).reset_index(drop=True)
     df.insert(0, "rank", range(1, len(df) + 1))
     return df
@@ -1195,6 +1209,12 @@ def build_all_games_best(probs_df: pd.DataFrame) -> pd.DataFrame:
             "confidence": r.get("confidence", ""),
             "home_xg": r.get("home_xg", ""),
             "away_xg": r.get("away_xg", ""),
+            "home_corners_avg": r.get("home_corners_avg", ""),
+            "away_corners_avg": r.get("away_corners_avg", ""),
+            "exp_home_corners": r.get("exp_home_corners", ""),
+            "exp_away_corners": r.get("exp_away_corners", ""),
+            "exp_total_corners": r.get("exp_total_corners", ""),
+            "league_avg_corners": r.get("league_avg_corners", ""),
         })
 
     if not rows:
@@ -1221,7 +1241,10 @@ def build_combo_bets(probs_df, top_k=COMBO_TOP_N):
             rows.append({"utcDate": r["utcDate"], "league": r["league"], "home": r["home"], "away": r["away"],
                          "bet": label, "prob": round(prob, 3), "model_implied_odds": round(1/prob, 2) if prob else "",
                          "confidence": round(conf, 3), "home_xg": round(lh, 2), "away_xg": round(la, 2),
-                         "score": round(sc, 4)})
+                         "score": round(sc, 4),
+                         "exp_total_corners": r.get("exp_total_corners", ""),
+                         "home_corners_avg": r.get("home_corners_avg", ""),
+                         "away_corners_avg": r.get("away_corners_avg", "")})
     df = pd.DataFrame(rows)
     if df.empty:
         return df
@@ -1255,7 +1278,8 @@ def build_shortlist(best_df, safe_df, bal_df, size=SHORTLIST_SIZE):
     mix = _dedupe_matches(mix, limit=size)
 
     keep = ["rank", "utcDate", "league", "home", "away", "bet", "prob", "odds", "fractional",
-            "stake", "edge", "confidence", "score", "source", "odds_source", "warning"]
+            "stake", "edge", "confidence", "score", "source", "odds_source", "warning",
+            "exp_total_corners", "home_corners_avg", "away_corners_avg"]
     return mix[[c for c in keep if c in mix.columns]]
 
 def build_dashboard(shortlist, history, bankroll):
@@ -1720,6 +1744,11 @@ def main():
 
     fx_df = pd.DataFrame(fixtures)
     rs_df = pd.DataFrame(results)
+    try:
+        fx_df = attach_corner_avgs(fx_df)
+        log(f"corner avgs attached to {len(fx_df)} fixture(s)")
+    except Exception as e:
+        log(f"corner avgs skipped: {e}")
     write_df(TAB_FIXTURES, sort_by_date(fx_df))
     write_df(TAB_ACCESS, pd.DataFrame(access_rows))
 
@@ -1780,6 +1809,10 @@ def main():
                            "league_base_total": round(base_home + base_away, 3),
                            "confidence": round(conf, 3), **p})
     probs_df = pd.DataFrame(probs_rows)
+    try:
+        probs_df = attach_corner_avgs(probs_df)
+    except Exception as e:
+        log(f"corner avgs on probs skipped: {e}")
 
     odds_map = {}
     try:
