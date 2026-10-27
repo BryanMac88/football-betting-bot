@@ -29,20 +29,14 @@ logger = logging.getLogger(__name__)
 
 # football-data.org league code → football-data.co.uk CSV code
 FD_TO_CSV = {
-    "PL": "E0",
-    "ELC": "E1",
-    "EL1": "E2",
-    "EL2": "E3",
-    "NL": "E3",   # closest free file; National League not always published
-    "PD": "SP1",
-    "SD": "SP2",
-    "SA": "I1",
-    "BL1": "D1",
-    "FL1": "F1",
-    "DED": "N1",
-    "PPL": "P1",
-    "SPL": "SC0",
-    "BSA": "BR1",
+    "PL": "E0",    # Premier League
+    "ELC": "E1",   # Championship
+    "EL1": "E2",   # League One
+    "EL2": "E3",   # League Two
+    # ENL (National League) has no free season CSV with HC/AC on football-data.co.uk
+    "PD": "SP1",   # La Liga
+    "BL1": "D1",   # Bundesliga
+    "FL1": "F1",   # Ligue 1
 }
 
 # season folder on football-data.co.uk (update each August)
@@ -309,6 +303,51 @@ def attach_corner_avgs(df: pd.DataFrame) -> pd.DataFrame:
     for c in cols:
         out[c] = extra[c]
     return out
+
+
+
+def lookup_match_corners(league: str, home: str, away: str, match_date: str = "") -> Optional[int]:
+    """Return HC+AC for a finished match from football-data.co.uk CSV, or None."""
+    cache = get_fd_odds_cache()
+    if league not in cache._by_league:
+        cache.load_league(league)
+    df = cache._by_league.get(league)
+    if df is None or df.empty or "HC" not in df.columns or "AC" not in df.columns:
+        return None
+    hn, an = _normalize(home), _normalize(away)
+    mask = (df["_hn"] == hn) & (df["_an"] == an)
+    sub = df[mask]
+    if sub.empty:
+        mask = df["_hn"].str.contains(hn[:6], na=False) & df["_an"].str.contains(an[:6], na=False)
+        sub = df[mask]
+    if sub.empty:
+        return None
+    # Prefer row matching date if provided
+    if match_date and "Date" in sub.columns:
+        d = str(match_date)[:10]
+        # CSV dates are often DD/MM/YYYY
+        def _row_date(val) -> str:
+            s = str(val)
+            if "/" in s:
+                parts = s.split("/")
+                if len(parts) == 3:
+                    dd, mm, yy = parts
+                    if len(yy) == 2:
+                        yy = "20" + yy
+                    return f"{yy}-{mm.zfill(2)}-{dd.zfill(2)}"
+            return s[:10]
+        dated = sub[sub["Date"].map(_row_date) == d]
+        if not dated.empty:
+            sub = dated
+    row = sub.iloc[-1]
+    try:
+        hc = float(row["HC"])
+        ac = float(row["AC"])
+        if hc != hc or ac != ac:
+            return None
+        return int(hc + ac)
+    except Exception:
+        return None
 
 
 def model_implied_odds(prob: Any) -> Optional[float]:
