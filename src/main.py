@@ -23,15 +23,21 @@ from bet_tracking import combo_probs, COMBO_SPECS, evaluate_bet, decimal_to_frac
 from performance import apply_performance_filter, apply_league_weighting
 from odds_sources import (
     get_fd_odds_cache, merge_odds_entry, model_implied_odds, attach_corner_avgs,
+    lookup_match_corners,
 )
 
 
 # ================= CONFIG =================
+# League focus (football-data.org codes):
+#   England: PL, Championship, L1, L2, National League
+#   Top EU: Ligue 1, La Liga, Bundesliga
+#   Europe: Champions League, Europa League, Conference League
 BASE_COMP_CODES = [
-    "PL", "PD", "SA", "BL1", "FL1", "CL", "EL", "EC",
-    "ELC", "EL1", "EL2", "NL", "SPL", "SD", "SF", "DED", "PPL",
+    "PL", "ELC", "EL1", "EL2", "ENL",
+    "FL1", "PD", "BL1",
+    "CL", "EL", "EC",
 ]
-OPTIONAL_COMP_CODES = ["BSA", "MLS"]
+OPTIONAL_COMP_CODES: list = []
 
 SLEEP_SECONDS = 7.0
 DAYS_AHEAD = 3
@@ -92,6 +98,7 @@ TAB_HISTORY = "Bet_History"
 TAB_ACCURACY = "Accuracy"
 TAB_SHORTLIST = "Todays_Shortlist"
 TAB_ALL_GAMES = "All_Games_Best"
+TAB_CORNERS_O95 = "Over_9_5_Corners"
 TAB_DASHBOARD = "Dashboard"
 TAB_CONFIG = "Config"
 
@@ -174,6 +181,7 @@ def market_weight(bet: str) -> float:
     if b == "DRAW": return 0.88
     if b.startswith("DOUBLE CHANCE"): return 0.92
     if b in ("BTTS YES", "BTTS NO"): return 0.94
+    if "CORNER" in b: return 0.90
     if b.startswith("OVER ") or b.startswith("UNDER "): return 0.92
     if "&" in b: return 0.88
     return 0.90
@@ -1228,6 +1236,73 @@ def build_all_games_best(probs_df: pd.DataFrame) -> pd.DataFrame:
     df.insert(0, "rank", range(1, len(df) + 1))
     return df
 
+
+def _poisson_cdf_ge(lam: float, k: int) -> float:
+    """P(X >= k) for X ~ Poisson(lam)."""
+    if lam <= 0:
+        return 0.0 if k > 0 else 1.0
+    # P(X >= k) = 1 - P(X <= k-1)
+    s = 0.0
+    term = math.exp(-lam)
+    for i in range(0, k):
+        if i > 0:
+            term *= lam / i
+        s += term
+    return max(0.0, min(1.0, 1.0 - s))
+
+
+def build_over_corners(
+    probs_df: pd.DataFrame,
+    line: float = 9.5,
+    top_n: int = TOP_N,
+) -> pd.DataFrame:
+    """Rank fixtures by P(corners > line) using Poisson(exp_total_corners)."""
+    if probs_df is None or probs_df.empty:
+        return pd.DataFrame()
+    if "exp_total_corners" not in probs_df.columns:
+        return pd.DataFrame()
+
+    bet_label = f"OVER {line} CORNERS"
+    rows = []
+    for _, r in probs_df.iterrows():
+        try:
+            lam = float(r.get("exp_total_corners") or 0)
+        except (TypeError, ValueError):
+            continue
+        if lam <= 0:
+            continue
+        # Over 9.5 → need 10+ corners
+        need = int(math.floor(line) + 1)
+        prob = _poisson_cdf_ge(lam, need)
+        if prob < 0.35:
+            continue
+        conf = safe_float(r.get("confidence"), 0.5)
+        rows.append({
+            "utcDate": r.get("utcDate", ""),
+            "league": r.get("league", ""),
+            "home": r.get("home", ""),
+            "away": r.get("away", ""),
+            "bet": bet_label,
+            "prob": round(prob, 3),
+            "confidence": round(conf, 3),
+            "exp_total_corners": round(lam, 2),
+            "home_corners_avg": r.get("home_corners_avg", ""),
+            "away_corners_avg": r.get("away_corners_avg", ""),
+            "league_avg_corners": r.get("league_avg_corners", ""),
+            "score": round(prob * conf, 4),
+        })
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows).sort_values(["score", "prob", "exp_total_corners"],
+                                        ascending=[False, False, False]).reset_index(drop=True)
+    df = _dedupe_matches(df, limit=top_n)
+    if "rank" not in df.columns:
+        df.insert(0, "rank", range(1, len(df) + 1))
+    else:
+        df["rank"] = range(1, len(df) + 1)
+    return df
+
+
 def build_combo_bets(probs_df, top_k=COMBO_TOP_N):
     if probs_df is None or probs_df.empty:
         return pd.DataFrame()
@@ -1352,6 +1427,7 @@ def _match_bet_key(row):
 # already logged the same match+bet. Primary recommendation tabs only.
 _PRIMARY_HISTORY_SOURCES = {
     "Best_Bets", "Safe_Picks", "Balanced_Picks", "Combo_Bets",
+    "Over_9_5_Corners",
 }
 
 
@@ -1424,7 +1500,18 @@ def settle_history(history, rs_df):
         if key not in results:
             continue
         hg, ag = results[key]
-        won = evaluate_bet(str(h.get("bet", "")), hg, ag)
+        bet_str = str(h.get("bet", ""))
+        total_corners = None
+        if "CORNER" in bet_str.upper():
+            total_corners = lookup_match_corners(
+                str(h.get("league", "")),
+                str(h.get("home", "")),
+                str(h.get("away", "")),
+                str(h.get("utcDate", "")),
+            )
+            if total_corners is None:
+                continue  # keep PENDING until corners appear in CSV
+        won = evaluate_bet(bet_str, hg, ag, total_corners=total_corners)
         if won is None:
             continue
         out.at[i, "result"] = "WON" if won else "LOST"
@@ -1754,7 +1841,8 @@ def main():
 
     top10_specs = [("p_over_1_5", "OVER 1.5", "Top10_Over_1_5"),
                    ("p_over_2_5", "OVER 2.5", "Top10_Over_2_5")]
-    visible_tabs = [TAB_ALL_GAMES, TAB_BEST_BETS, "Top10_Over_1_5", "Top10_Over_2_5", TAB_COMBOS,
+    visible_tabs = [TAB_ALL_GAMES, TAB_BEST_BETS, "Top10_Over_1_5", "Top10_Over_2_5",
+                    TAB_CORNERS_O95, TAB_COMBOS,
                     TAB_SAFE, TAB_BAL, TAB_SHORTLIST, TAB_DASHBOARD, TAB_ACCURACY]
 
     history = read_df(TAB_HISTORY)
@@ -1769,7 +1857,7 @@ def main():
         log(f"=== DONE ({reason}) ===")
 
     if rs_df.empty:
-        for t in (TAB_TEAM_FORM, TAB_PICKS, TAB_SAFE, TAB_BAL, TAB_BEST_BETS, TAB_ALL_GAMES, TAB_COMBOS, TAB_SHORTLIST, TAB_DASHBOARD):
+        for t in (TAB_TEAM_FORM, TAB_PICKS, TAB_SAFE, TAB_BAL, TAB_BEST_BETS, TAB_ALL_GAMES, TAB_CORNERS_O95, TAB_COMBOS, TAB_SHORTLIST, TAB_DASHBOARD):
             write_df(t, pd.DataFrame())
         for _, _, t in top10_specs:
             write_df(t, pd.DataFrame())
@@ -1781,7 +1869,7 @@ def main():
     write_df(TAB_TEAM_FORM, team_idx.reset_index())
 
     if fx_df.empty:
-        for t in (TAB_PICKS, TAB_SAFE, TAB_BAL, TAB_BEST_BETS, TAB_ALL_GAMES, TAB_COMBOS, TAB_SHORTLIST, TAB_DASHBOARD):
+        for t in (TAB_PICKS, TAB_SAFE, TAB_BAL, TAB_BEST_BETS, TAB_ALL_GAMES, TAB_CORNERS_O95, TAB_COMBOS, TAB_SHORTLIST, TAB_DASHBOARD):
             write_df(t, pd.DataFrame())
         for _, _, t in top10_specs:
             write_df(t, pd.DataFrame())
@@ -1839,6 +1927,20 @@ def main():
         final = ensure_at_least_one(soft, soft, size=3)
         write_df(tab, sort_by_date(final))
         top10_frames[tab] = final
+
+    # ---------- Over 9.5 Corners ----------
+    log("Over_9_5_Corners...")
+    soft_corners = attach_odds(
+        build_over_corners(probs_df, line=9.5, top_n=TOP_N * 2),
+        odds_map, bankroll, apply_filter=False,
+    )
+    strict_corners = attach_odds(
+        build_over_corners(probs_df, line=9.5, top_n=TOP_N),
+        odds_map, bankroll, apply_filter=False,
+    )
+    corners_df = ensure_at_least_one(strict_corners, soft_corners, size=3)
+    write_df(TAB_CORNERS_O95, sort_by_date(corners_df))
+    top10_frames[TAB_CORNERS_O95] = corners_df
 
     baselines = build_league_market_baselines(probs_df)
 
