@@ -12,6 +12,7 @@ football-data.co.uk columns used:
   B365>2.5 / B365<2.5     Bet365 totals
   AvgH / AvgD / AvgA      market average 1X2
   Avg>2.5 / Avg<2.5       market average totals
+  HC / AC                 home / away corners (for averages)
 """
 from __future__ import annotations
 
@@ -164,12 +165,150 @@ class FootballDataOdds:
         }
 
 
+
+    # ---------- Corner averages (HC / AC) ----------
+    def _team_corner_table(self, league: str) -> Dict[str, Dict[str, float]]:
+        """Per normalised team name: home/away corners for & against."""
+        if league not in self._by_league:
+            self.load_league(league)
+        df = self._by_league.get(league)
+        if df is None or df.empty or "HC" not in df.columns or "AC" not in df.columns:
+            return {}
+
+        rows: Dict[str, Dict[str, list]] = {}
+        for _, r in df.iterrows():
+            try:
+                hc = float(r["HC"])
+                ac = float(r["AC"])
+            except Exception:
+                continue
+            if hc != hc or ac != ac:  # NaN
+                continue
+            hn = str(r.get("_hn") or "")
+            an = str(r.get("_an") or "")
+            if hn:
+                rows.setdefault(hn, {"hf": [], "ha": [], "af": [], "aa": []})
+                rows[hn]["hf"].append(hc)  # corners for at home
+                rows[hn]["ha"].append(ac)  # corners against at home
+            if an:
+                rows.setdefault(an, {"hf": [], "ha": [], "af": [], "aa": []})
+                rows[an]["af"].append(ac)  # corners for away
+                rows[an]["aa"].append(hc)  # corners against away
+
+        out: Dict[str, Dict[str, float]] = {}
+        for team, buckets in rows.items():
+            def _m(vals):
+                return sum(vals) / len(vals) if vals else float("nan")
+            out[team] = {
+                "home_for": _m(buckets["hf"]),
+                "home_against": _m(buckets["ha"]),
+                "away_for": _m(buckets["af"]),
+                "away_against": _m(buckets["aa"]),
+                "n_home": float(len(buckets["hf"])),
+                "n_away": float(len(buckets["af"])),
+            }
+        return out
+
+    def _find_team_key(self, table: Dict[str, Dict[str, float]], name: str) -> Optional[str]:
+        key = _normalize(name)
+        if not key:
+            return None
+        if key in table:
+            return key
+        # fuzzy: startswith / contains
+        for k in table:
+            if k.startswith(key[:6]) or key.startswith(k[:6]) or key in k or k in key:
+                return k
+        return None
+
+    def league_avg_corners(self, league: str) -> float:
+        """Season average total corners per match in this league."""
+        if league not in self._by_league:
+            self.load_league(league)
+        df = self._by_league.get(league)
+        if df is None or df.empty or "HC" not in df.columns or "AC" not in df.columns:
+            return 10.0  # global rough default
+        totals = pd.to_numeric(df["HC"], errors="coerce") + pd.to_numeric(df["AC"], errors="coerce")
+        m = totals.mean()
+        return float(m) if m == m else 10.0
+
+    def expected_corners(self, league: str, home: str, away: str) -> Dict[str, float]:
+        """Expected corners for a fixture from season HC/AC averages.
+
+        Returns keys:
+          home_corners_avg  — home team corners-for when playing at home
+          away_corners_avg  — away team corners-for when playing away
+          exp_home_corners  — blended expected corners for the home side
+          exp_away_corners  — blended expected corners for the away side
+          exp_total_corners — expected match total
+          league_avg_corners — league season average total
+        """
+        table = self._team_corner_table(league)
+        league_avg = self.league_avg_corners(league)
+        half = league_avg / 2.0
+
+        hk = self._find_team_key(table, home)
+        ak = self._find_team_key(table, away)
+        ht = table.get(hk) if hk else None
+        at = table.get(ak) if ak else None
+
+        home_for = ht["home_for"] if ht and ht["home_for"] == ht["home_for"] else half
+        home_ag = ht["home_against"] if ht and ht["home_against"] == ht["home_against"] else half
+        away_for = at["away_for"] if at and at["away_for"] == at["away_for"] else half
+        away_ag = at["away_against"] if at and at["away_against"] == at["away_against"] else half
+
+        # Blend attack (for) with opponent defence (against)
+        exp_home = (home_for + away_ag) / 2.0
+        exp_away = (away_for + home_ag) / 2.0
+        exp_total = exp_home + exp_away
+
+        return {
+            "home_corners_avg": round(float(home_for), 2),
+            "away_corners_avg": round(float(away_for), 2),
+            "exp_home_corners": round(float(exp_home), 2),
+            "exp_away_corners": round(float(exp_away), 2),
+            "exp_total_corners": round(float(exp_total), 2),
+            "league_avg_corners": round(float(league_avg), 2),
+        }
+
+
 # Singleton cache used by main
 _FD_ODDS = FootballDataOdds()
 
 
 def get_fd_odds_cache() -> FootballDataOdds:
     return _FD_ODDS
+
+
+def attach_corner_avgs(df: pd.DataFrame) -> pd.DataFrame:
+    """Add corner average columns to a fixtures / probs DataFrame."""
+    if df is None or df.empty:
+        return df
+    cache = get_fd_odds_cache()
+    leagues = list(df["league"].unique()) if "league" in df.columns else []
+    cache.load_for_fixtures(leagues)
+
+    cols = [
+        "home_corners_avg", "away_corners_avg",
+        "exp_home_corners", "exp_away_corners",
+        "exp_total_corners", "league_avg_corners",
+    ]
+    rows = []
+    for _, r in df.iterrows():
+        try:
+            stats = cache.expected_corners(
+                str(r.get("league", "")),
+                str(r.get("home", "")),
+                str(r.get("away", "")),
+            )
+        except Exception:
+            stats = {c: "" for c in cols}
+        rows.append(stats)
+    extra = pd.DataFrame(rows, index=df.index)
+    out = df.copy()
+    for c in cols:
+        out[c] = extra[c]
+    return out
 
 
 def model_implied_odds(prob: Any) -> Optional[float]:
