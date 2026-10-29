@@ -246,6 +246,57 @@ def match_probs(lh: float, la: float) -> Dict[str, float]:
     }
 
 
+# ================= EXPECTED CORNERS (single source: All_Games_Best) =================
+# The All_Games_Best build is the source of truth for expected total corners.
+# Its values are stamped onto every other tab (and the bet history) by match,
+# so every tab shows the identical number for the same fixture.
+_ALL_GAMES_CORNERS: Dict[Tuple[str, str, str], float] = {}
+
+
+def set_corner_lookup(all_games_df: Optional[pd.DataFrame]) -> None:
+    """Load expected total corners from the All_Games_Best frame, keyed by match."""
+    _ALL_GAMES_CORNERS.clear()
+    if all_games_df is None or all_games_df.empty or "exp_total_corners" not in all_games_df.columns:
+        return
+    for _, r in all_games_df.iterrows():
+        v = pd.to_numeric(r.get("exp_total_corners"), errors="coerce")
+        if pd.notna(v):
+            key = (str(r.get("league", "")), str(r.get("home", "")), str(r.get("away", "")))
+            _ALL_GAMES_CORNERS[key] = round(float(v), 2)
+
+
+def stamp_corners(df: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
+    """Set exp_total_corners on any match-level frame from the All_Games_Best lookup."""
+    if df is None or df.empty or not _ALL_GAMES_CORNERS:
+        return df
+    if not {"league", "home", "away"}.issubset(df.columns):
+        return df
+    out = df.copy()
+    if "exp_total_corners" not in out.columns:
+        out["exp_total_corners"] = ""
+    out["exp_total_corners"] = out["exp_total_corners"].astype(object)
+    old_vals = list(out["exp_total_corners"])
+    new_vals = []
+    for lg, h, a, old in zip(out["league"], out["home"], out["away"], old_vals):
+        v = _ALL_GAMES_CORNERS.get((str(lg), str(h), str(a)))
+        new_vals.append(v if v is not None else old)
+    out["exp_total_corners"] = new_vals
+    return out
+
+
+def _move_corners_column(df: pd.DataFrame) -> pd.DataFrame:
+    """Place exp_total_corners right after the bet column (or after away) so it is easy to see."""
+    if df is None or df.empty or "exp_total_corners" not in df.columns:
+        return df
+    cols = list(df.columns)
+    anchor = "bet" if "bet" in cols else ("away" if "away" in cols else None)
+    if anchor is None:
+        return df
+    cols.remove("exp_total_corners")
+    cols.insert(cols.index(anchor) + 1, "exp_total_corners")
+    return df[cols]
+
+
 # ================= GOOGLE SHEETS =================
 def gs() -> gspread.Client:
     creds = Credentials.from_service_account_info(
@@ -282,7 +333,13 @@ NUMBER_COLUMNS = {
     "avg_odds", "profit_money", "clv", "roi_stake_wtd",
     "home_corners_avg", "away_corners_avg",
     "exp_home_corners", "exp_away_corners", "exp_total_corners", "league_avg_corners",
+    "actual_corners", "avg_exp_corners", "avg_actual_corners",
+    "corners_bias", "corners_mae",
 }
+
+# Columns that get a yellow highlight on every tab they appear on
+HIGHLIGHT_COLUMNS = {"exp_total_corners", "avg_exp_corners"}
+HIGHLIGHT_RGB = {"red": 1.0, "green": 0.92, "blue": 0.55}
 
 
 def _is_percent_col(name: str) -> bool:
@@ -295,8 +352,14 @@ def _is_percent_col(name: str) -> bool:
     return False
 
 
-def write_df(name: str, df: pd.DataFrame):
-    """Write a DataFrame and auto-format probability columns as 0.00%."""
+def write_df(name: str, df: pd.DataFrame, corners_view: bool = True):
+    """Write a DataFrame and auto-format probability columns as 0.00%.
+
+    corners_view=True stamps expected total corners (from All_Games_Best) onto
+    match-level frames and moves that column next to the bet. The highlight is
+    applied whenever a highlight column is present. Bet_History passes False so
+    the expected value logged at bet time is never overwritten.
+    """
     sh = open_sheet()
     ws = _get_or_create_ws(sh, name)
     ws.clear()
@@ -304,10 +367,14 @@ def write_df(name: str, df: pd.DataFrame):
         ws.update([["(no data)"]])
         return
 
-    out = df.copy()
+    if corners_view:
+        out = _move_corners_column(stamp_corners(df))
+    else:
+        out = df.copy()
     cols = list(out.columns)
     percent_idxs = [i for i, c in enumerate(cols) if _is_percent_col(c)]
     number_idxs = [i for i, c in enumerate(cols) if str(c).strip().lower() in NUMBER_COLUMNS]
+    highlight_idxs = [i for i, c in enumerate(cols) if str(c).strip().lower() in HIGHLIGHT_COLUMNS]
 
     header = cols
     rows: List[List[Any]] = []
@@ -380,6 +447,49 @@ def write_df(name: str, df: pd.DataFrame):
                 "fields": "userEnteredFormat.numberFormat",
             }
         })
+
+    # Highlight expected-corners columns (header + data) in yellow, bold
+    for col_idx in highlight_idxs:
+        reqs.append({
+            "repeatCell": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "startRowIndex": 0,
+                    "endRowIndex": n_rows + 1,
+                    "startColumnIndex": col_idx,
+                    "endColumnIndex": col_idx + 1,
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "backgroundColor": HIGHLIGHT_RGB,
+                        "textFormat": {"bold": True},
+                    }
+                },
+                "fields": "userEnteredFormat(backgroundColor,textFormat)",
+            }
+        })
+    # Dashboard-style tabs: highlight any metric row that is about corners
+    if "metric" in cols:
+        for pos, metric in enumerate(out["metric"].astype(str).tolist()):
+            if "corner" in metric.lower():
+                reqs.append({
+                    "repeatCell": {
+                        "range": {
+                            "sheetId": sheet_id,
+                            "startRowIndex": pos + 1,
+                            "endRowIndex": pos + 2,
+                            "startColumnIndex": 0,
+                            "endColumnIndex": len(cols),
+                        },
+                        "cell": {
+                            "userEnteredFormat": {
+                                "backgroundColor": HIGHLIGHT_RGB,
+                                "textFormat": {"bold": True},
+                            }
+                        },
+                        "fields": "userEnteredFormat(backgroundColor,textFormat)",
+                    }
+                })
     if reqs:
         try:
             sh.batch_update({"requests": reqs})
@@ -1362,6 +1472,10 @@ def build_dashboard(shortlist, history, bankroll):
     rows.append({"metric": "Run time (UTC)", "value": now().strftime("%Y-%m-%d %H:%M")})
     rows.append({"metric": "Bankroll", "value": f"{bankroll:.0f}"})
     rows.append({"metric": "Shortlist size", "value": len(shortlist) if shortlist is not None else 0})
+    if _ALL_GAMES_CORNERS:
+        corner_vals = list(_ALL_GAMES_CORNERS.values())
+        rows.append({"metric": "Avg expected total corners (all games)",
+                     "value": f"{sum(corner_vals) / len(corner_vals):.2f}"})
     if shortlist is not None and not shortlist.empty and "stake" in shortlist.columns:
         total_stake = pd.to_numeric(shortlist["stake"], errors="coerce").sum()
         rows.append({"metric": "Total recommended stake", "value": f"{total_stake:.2f}"})
@@ -1409,6 +1523,7 @@ HISTORY_COLS = [
     "logged_utc", "utcDate", "league", "home", "away", "bet", "source",
     "prob", "odds", "fractional", "odds_source", "stake", "edge", "closing_odds",
     "result", "score", "profit", "profit_money", "clv",
+    "exp_total_corners", "actual_corners",
 ]
 
 def _hist_key(row):
@@ -1438,9 +1553,13 @@ def append_new_picks(history, picks, source):
     logged the same match+bet yet.
     Secondary sources (Top10_*) only log when *no* source has logged that match+bet,
     so Accuracy is not flooded with duplicates.
+
+    Expected total corners (from All_Games_Best) is stored with every logged bet
+    so the Accuracy tab can compare it with the actual corners later.
     """
     if picks is None or picks.empty:
         return history
+    picks = stamp_corners(picks)
     existing_full = set()
     existing_match_bet = set()
     if history is not None and not history.empty:
@@ -1468,6 +1587,7 @@ def append_new_picks(history, picks, source):
             "stake": p.get("stake", ""), "edge": p.get("edge", ""),
             "closing_odds": p.get("closing_odds", ""), "result": "PENDING",
             "score": "", "profit": "", "profit_money": "", "clv": "",
+            "exp_total_corners": p.get("exp_total_corners", ""), "actual_corners": "",
         })
         existing_full.add(full)
         existing_match_bet.add(mb)
@@ -1489,7 +1609,8 @@ def settle_history(history, rs_df):
             continue
     settled = 0
     out = history.copy()
-    for col in ("result", "score", "profit", "profit_money", "clv"):
+    for col in ("result", "score", "profit", "profit_money", "clv",
+                "exp_total_corners", "actual_corners"):
         if col not in out.columns:
             out[col] = ""
         out[col] = out[col].astype(object)
@@ -1516,6 +1637,19 @@ def settle_history(history, rs_df):
             continue
         out.at[i, "result"] = "WON" if won else "LOST"
         out.at[i, "score"] = f"{hg}-{ag}"
+        # Actual total corners for the expected-corners accuracy (best effort, never blocks settling)
+        actual_corners = total_corners
+        if actual_corners is None:
+            try:
+                actual_corners = lookup_match_corners(
+                    str(h.get("league", "")),
+                    str(h.get("home", "")),
+                    str(h.get("away", "")),
+                    str(h.get("utcDate", "")),
+                )
+            except Exception:
+                actual_corners = None
+        out.at[i, "actual_corners"] = actual_corners if actual_corners is not None else ""
         try:
             odds = float(h.get("odds") or 0)
         except Exception:
@@ -1545,6 +1679,32 @@ def settle_history(history, rs_df):
         settled += 1
     if settled:
         log(f"  settled {settled} bet(s)")
+
+    # Backfill actual corners for already-settled bets that were logged with an
+    # expected-corners value but whose corners were not yet in the CSV at settle time.
+    backfilled = 0
+    for i, h in out.iterrows():
+        if str(h.get("result", "")).upper() not in ("WON", "LOST"):
+            continue
+        if str(h.get("actual_corners", "")).strip() != "":
+            continue
+        if str(h.get("exp_total_corners", "")).strip() == "":
+            continue
+        try:
+            got = lookup_match_corners(
+                str(h.get("league", "")),
+                str(h.get("home", "")),
+                str(h.get("away", "")),
+                str(h.get("utcDate", "")),
+            )
+        except Exception:
+            got = None
+        if got is None:
+            continue
+        out.at[i, "actual_corners"] = got
+        backfilled += 1
+    if backfilled:
+        log(f"  backfilled actual corners on {backfilled} settled bet(s)")
     return out
 
 def refresh_closing_odds(history, odds_map):
@@ -1619,12 +1779,61 @@ def _odds_bracket(odds_val) -> str:
     return "5.00+ (very long)"
 
 
+def _corners_accuracy_rows(settled: pd.DataFrame) -> List[Dict[str, Any]]:
+    """Expected-total-corners accuracy: expected (from All_Games_Best, logged at bet time)
+    vs actual total corners, one row per match (not per bet)."""
+    placeholder = [{
+        "grouping": "expected corners",
+        "value": "(waiting for settled matches with corners data)",
+        "bets": 0, "note": "",
+    }]
+    if settled is None or settled.empty:
+        return placeholder
+    if "exp_total_corners" not in settled.columns or "actual_corners" not in settled.columns:
+        return placeholder
+
+    c = settled.copy()
+    c["exp_c"] = pd.to_numeric(c["exp_total_corners"], errors="coerce")
+    c["act_c"] = pd.to_numeric(c["actual_corners"], errors="coerce")
+    c = c.dropna(subset=["exp_c", "act_c"])
+    if c.empty:
+        return placeholder
+    c["_match"] = (c["utcDate"].astype(str).str[:10] + "|" +
+                   c["home"].astype(str) + "|" + c["away"].astype(str))
+    c = c.drop_duplicates(subset=["_match"], keep="first")
+    c["err"] = c["exp_c"] - c["act_c"]
+
+    def _row(value, sub):
+        n = len(sub)
+        within2 = float((sub["err"].abs() <= 2).mean())
+        return {
+            "grouping": "expected corners",
+            "value": value,
+            "bets": n,
+            "avg_exp_corners": round(float(sub["exp_c"].mean()), 2),
+            "avg_actual_corners": round(float(sub["act_c"].mean()), 2),
+            "corners_bias": round(float(sub["err"].mean()), 2),
+            "corners_mae": round(float(sub["err"].abs().mean()), 2),
+            "corners_within_2": f"{round(within2 * 100)}%",
+            "note": "LOW SAMPLE" if n < SAMPLE_SIZE_WARNING else "",
+        }
+
+    rows = [_row("all matches", c)]
+    if "league" in c.columns:
+        for lg, sub in c.groupby("league"):
+            if str(lg).strip():
+                rows.append(_row(f"league: {lg}", sub))
+    return rows
+
+
 def build_accuracy(history):
     """Settled-bet performance by overall / bet / source / league / odds bracket / odds source.
 
     OVERALL and time-window rows de-dupe the same match+bet logged from multiple tabs
     (Best/Safe/Balanced/Top10) so hit rate is not inflated.
     Includes unit ROI, stake-weighted ROI, and avg CLV when available.
+    Also includes an 'expected corners' block: expected total corners (from
+    All_Games_Best) vs actual total corners.
     """
     if history is None or history.empty:
         return pd.DataFrame()
@@ -1743,9 +1952,13 @@ def build_accuracy(history):
         if br in present.index:
             _summ("by odds bracket", br, settled_dedup[settled_dedup["odds_bracket"] == br])
 
+    # Expected total corners (from All_Games_Best) vs actual
+    rows.extend(_corners_accuracy_rows(settled))
+
     df = pd.DataFrame(rows)
     order = {
         "OVERALL": 0,
+        "expected corners": 0.5,
         "by bet type": 1,
         "by source tab": 2,
         "by league": 3,
@@ -1764,6 +1977,9 @@ def build_accuracy(history):
         if g == "OVERALL":
             # all bets first, then last 30 days
             return (base, 0 if "all bets" in str(row["value"]) else 1)
+        if g == "expected corners":
+            # "all matches" first, then leagues by sample size
+            return (base, 0 if str(row["value"]) == "all matches" else 1, -int(row["bets"] or 0))
         return (base, -int(row["bets"]))
 
     df["_s"] = df.apply(_sort_key, axis=1)
@@ -1851,7 +2067,8 @@ def main():
     bankroll = apply_settled_to_bankroll(history, bankroll)
 
     def _finish(reason):
-        write_df(TAB_HISTORY, history if history is not None and not history.empty else pd.DataFrame())
+        write_df(TAB_HISTORY, history if history is not None and not history.empty else pd.DataFrame(),
+                 corners_view=False)
         write_df(TAB_ACCURACY, build_accuracy(history))
         set_visible_tabs(visible_tabs)
         log(f"=== DONE ({reason}) ===")
@@ -1919,6 +2136,13 @@ def main():
         probs_df.at[i, "p_x2"] = probs_df.at[i, "p_draw"] + probs_df.at[i, "p_away"]
         probs_df.at[i, "p_12"] = probs_df.at[i, "p_home"] + probs_df.at[i, "p_away"]
 
+    # ---------- All_Games_Best is the source of truth for expected total corners ----------
+    # Built first so its expected corners are stamped onto every other tab and the history.
+    all_games_raw = build_all_games_best(probs_df)
+    set_corner_lookup(all_games_raw)
+    log(f"expected total corners available for {len(_ALL_GAMES_CORNERS)} of "
+        f"{len(all_games_raw) if all_games_raw is not None else 0} game(s)")
+
     # ---------- Top10 tabs ----------
     top10_frames = {}
     for col, label, tab in top10_specs:
@@ -1982,7 +2206,7 @@ def main():
 
     # ---------- All_Games_Best (every fixture, most probable outcome, sorted by league) ----------
     log("All_Games_Best...")
-    all_games_df = attach_odds(build_all_games_best(probs_df), odds_map, bankroll, apply_filter=False)
+    all_games_df = attach_odds(all_games_raw, odds_map, bankroll, apply_filter=False)
     write_df(TAB_ALL_GAMES, all_games_df)
 
     # ---------- Combo_Bets ----------
@@ -2014,7 +2238,7 @@ def main():
             if c not in history.columns:
                 history[c] = ""
         history = history[HISTORY_COLS]
-    write_df(TAB_HISTORY, history)
+    write_df(TAB_HISTORY, history, corners_view=False)
     write_df(TAB_ACCURACY, build_accuracy(history))
 
     set_visible_tabs(visible_tabs)
